@@ -334,6 +334,14 @@ func (m *Manager) compileConfig(cfg Config) (rcfg resolver.Config, ocfg OSConfig
 		rcfg.Routes = routes
 		rcfg.Routes["."] = cfg.DefaultResolvers
 		ocfg.Nameservers = cfg.serviceIPs(m.knobs)
+		// On macOS, we need to set MatchDomains so that /etc/resolver/ files
+		// are created for split DNS routes (e.g., MagicDNS domains like ts.net).
+		// Without this, enabling "Override Local DNS" would delete the resolver
+		// files and break MagicDNS resolution.
+		// See https://github.com/tailscale/tailscale/issues/8436
+		if m.goos == "darwin" {
+			ocfg.MatchDomains = cfg.matchDomains()
+		}
 		return rcfg, ocfg, nil
 	}
 

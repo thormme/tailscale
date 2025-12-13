@@ -340,6 +340,35 @@ func TestManager(t *testing.T) {
 			},
 		},
 		{
+			// Regression test for https://github.com/tailscale/tailscale/issues/8436
+			// On macOS, when "Override Local DNS" is enabled (DefaultResolvers set) with
+			// MagicDNS routes, we need MatchDomains to be set so that /etc/resolver/ files
+			// are created for the MagicDNS domains. Without this, MagicDNS would break.
+			name: "corp-magic-darwin-needs-match-domains",
+			in: Config{
+				DefaultResolvers: mustRes("1.1.1.1", "9.9.9.9"),
+				SearchDomains:    fqdns("tailscale.com", "universe.tf"),
+				Routes:           upstreams("ts.com", ""),
+				Hosts: hosts(
+					"dave.ts.com.", "1.2.3.4",
+					"bradfitz.ts.com.", "2.3.4.5"),
+			},
+			split: true,
+			os: OSConfig{
+				Nameservers:   mustIPs("100.100.100.100"),
+				SearchDomains: fqdns("tailscale.com", "universe.tf"),
+				MatchDomains:  fqdns("ts.com"),
+			},
+			rs: resolver.Config{
+				Routes: upstreams(".", "1.1.1.1", "9.9.9.9"),
+				Hosts: hosts(
+					"dave.ts.com.", "1.2.3.4",
+					"bradfitz.ts.com.", "2.3.4.5"),
+				LocalDomains: fqdns("ts.com."),
+			},
+			goos: "darwin",
+		},
+		{
 			name: "corp-routes",
 			in: Config{
 				DefaultResolvers: mustRes("1.1.1.1", "9.9.9.9"),
