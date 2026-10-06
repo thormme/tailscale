@@ -618,7 +618,7 @@ func TestExtensionHostProfileStateChangeCallback(t *testing.T) {
 						NodeID:            "12345",
 						PrivateNodeKey:    key.NewNode(),
 						OldPrivateNodeKey: key.NewNode(),
-						NetworkLockKey:    key.NewNLPrivate(),
+						NetworkLockKey:    key.NewTLPrivate(),
 						UserProfile: tailcfg.UserProfile{
 							ID:            12345,
 							LoginName:     "test@example.com",
@@ -635,7 +635,7 @@ func TestExtensionHostProfileStateChangeCallback(t *testing.T) {
 						NodeID:            "12345",
 						PrivateNodeKey:    key.NodePrivate{}, // stripped
 						OldPrivateNodeKey: key.NodePrivate{}, // stripped
-						NetworkLockKey:    key.NLPrivate{},   // stripped
+						NetworkLockKey:    key.TLPrivate{},   // stripped
 						UserProfile: tailcfg.UserProfile{
 							ID:            12345,
 							LoginName:     "test@example.com",
@@ -690,7 +690,7 @@ func TestExtensionHostProfileStateChangeCallback(t *testing.T) {
 							NodeID:            "12345",
 							PrivateNodeKey:    key.NewNode(),
 							OldPrivateNodeKey: key.NewNode(),
-							NetworkLockKey:    key.NewNLPrivate(),
+							NetworkLockKey:    key.NewTLPrivate(),
 							UserProfile: tailcfg.UserProfile{
 								ID:            12345,
 								LoginName:     "test@example.com",
@@ -706,7 +706,7 @@ func TestExtensionHostProfileStateChangeCallback(t *testing.T) {
 							NodeID:            "12345",
 							PrivateNodeKey:    key.NewNode(),
 							OldPrivateNodeKey: key.NewNode(),
-							NetworkLockKey:    key.NewNLPrivate(),
+							NetworkLockKey:    key.NewTLPrivate(),
 							UserProfile: tailcfg.UserProfile{
 								ID:            12345,
 								LoginName:     "test@example.com",
@@ -727,7 +727,7 @@ func TestExtensionHostProfileStateChangeCallback(t *testing.T) {
 							NodeID:            "12345",
 							PrivateNodeKey:    key.NodePrivate{}, // stripped
 							OldPrivateNodeKey: key.NodePrivate{}, // stripped
-							NetworkLockKey:    key.NLPrivate{},   // stripped
+							NetworkLockKey:    key.TLPrivate{},   // stripped
 							UserProfile: tailcfg.UserProfile{
 								ID:            12345,
 								LoginName:     "test@example.com",
@@ -1010,9 +1010,8 @@ func TestNilExtensionHostMethodCall(t *testing.T) {
 	t.Parallel()
 
 	var h *ExtensionHost
-	typ := reflect.TypeOf(h)
-	for i := range typ.NumMethod() {
-		m := typ.Method(i)
+	typ := reflect.TypeFor[*ExtensionHost]()
+	for m := range typ.Methods() {
 		if strings.HasSuffix(m.Name, "ForTest") {
 			// Skip methods that are only for testing.
 			continue
@@ -1376,6 +1375,7 @@ func (b *testBackend) Sys() *tsd.System {
 func (b *testBackend) SendNotify(ipn.Notify)           { panic("not implemented") }
 func (b *testBackend) NodeBackend() ipnext.NodeBackend { panic("not implemented") }
 func (b *testBackend) TailscaleVarRoot() string        { panic("not implemented") }
+func (b *testBackend) authReconfig()                   { panic("not implemented") }
 
 func (b *testBackend) SwitchToBestProfile(reason string) {
 	b.mu.Lock()

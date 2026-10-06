@@ -5,193 +5,17 @@ package appc
 
 import (
 	"encoding/json"
-	"net/netip"
-	"reflect"
+	"fmt"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/appctype"
-	"tailscale.com/types/opt"
+	"tailscale.com/types/dnstype"
 )
 
-// TestHandleConnectorTransitIPRequestZeroLength tests that if sent a
-// ConnectorTransitIPRequest with 0 TransitIPRequests, we respond with a
-// ConnectorTransitIPResponse with 0 TransitIPResponses.
-func TestHandleConnectorTransitIPRequestZeroLength(t *testing.T) {
-	c := &Conn25{}
-	req := ConnectorTransitIPRequest{}
-	nid := tailcfg.NodeID(1)
-
-	resp := c.HandleConnectorTransitIPRequest(nid, req)
-	if len(resp.TransitIPs) != 0 {
-		t.Fatalf("n TransitIPs in response: %d, want 0", len(resp.TransitIPs))
-	}
-}
-
-// TestHandleConnectorTransitIPRequestStoresAddr tests that if sent a
-// request with a transit addr and a destination addr we store that mapping
-// and can retrieve it. If sent another req with a different dst for that transit addr
-// we store that instead.
-func TestHandleConnectorTransitIPRequestStoresAddr(t *testing.T) {
-	c := &Conn25{}
-	nid := tailcfg.NodeID(1)
-	tip := netip.MustParseAddr("0.0.0.1")
-	dip := netip.MustParseAddr("1.2.3.4")
-	dip2 := netip.MustParseAddr("1.2.3.5")
-	mr := func(t, d netip.Addr) ConnectorTransitIPRequest {
-		return ConnectorTransitIPRequest{
-			TransitIPs: []TransitIPRequest{
-				{TransitIP: t, DestinationIP: d},
-			},
-		}
-	}
-
-	resp := c.HandleConnectorTransitIPRequest(nid, mr(tip, dip))
-	if len(resp.TransitIPs) != 1 {
-		t.Fatalf("n TransitIPs in response: %d, want 1", len(resp.TransitIPs))
-	}
-	got := resp.TransitIPs[0].Code
-	if got != TransitIPResponseCode(0) {
-		t.Fatalf("TransitIP Code: %d, want 0", got)
-	}
-	gotAddr := c.transitIPTarget(nid, tip)
-	if gotAddr != dip {
-		t.Fatalf("Connector stored destination for tip: %v, want %v", gotAddr, dip)
-	}
-
-	// mapping can be overwritten
-	resp2 := c.HandleConnectorTransitIPRequest(nid, mr(tip, dip2))
-	if len(resp2.TransitIPs) != 1 {
-		t.Fatalf("n TransitIPs in response: %d, want 1", len(resp2.TransitIPs))
-	}
-	got2 := resp.TransitIPs[0].Code
-	if got2 != TransitIPResponseCode(0) {
-		t.Fatalf("TransitIP Code: %d, want 0", got2)
-	}
-	gotAddr2 := c.transitIPTarget(nid, tip)
-	if gotAddr2 != dip2 {
-		t.Fatalf("Connector stored destination for tip: %v, want %v", gotAddr, dip2)
-	}
-}
-
-// TestHandleConnectorTransitIPRequestMultipleTIP tests that we can
-// get a req with multiple mappings and we store them all. Including
-// multiple transit addrs for the same destination.
-func TestHandleConnectorTransitIPRequestMultipleTIP(t *testing.T) {
-	c := &Conn25{}
-	nid := tailcfg.NodeID(1)
-	tip := netip.MustParseAddr("0.0.0.1")
-	tip2 := netip.MustParseAddr("0.0.0.2")
-	tip3 := netip.MustParseAddr("0.0.0.3")
-	dip := netip.MustParseAddr("1.2.3.4")
-	dip2 := netip.MustParseAddr("1.2.3.5")
-	req := ConnectorTransitIPRequest{
-		TransitIPs: []TransitIPRequest{
-			{TransitIP: tip, DestinationIP: dip},
-			{TransitIP: tip2, DestinationIP: dip2},
-			// can store same dst addr for multiple transit addrs
-			{TransitIP: tip3, DestinationIP: dip},
-		},
-	}
-	resp := c.HandleConnectorTransitIPRequest(nid, req)
-	if len(resp.TransitIPs) != 3 {
-		t.Fatalf("n TransitIPs in response: %d, want 3", len(resp.TransitIPs))
-	}
-
-	for i := 0; i < 3; i++ {
-		got := resp.TransitIPs[i].Code
-		if got != TransitIPResponseCode(0) {
-			t.Fatalf("i=%d TransitIP Code: %d, want 0", i, got)
-		}
-	}
-	gotAddr1 := c.transitIPTarget(nid, tip)
-	if gotAddr1 != dip {
-		t.Fatalf("Connector stored destination for tip(%v): %v, want %v", tip, gotAddr1, dip)
-	}
-	gotAddr2 := c.transitIPTarget(nid, tip2)
-	if gotAddr2 != dip2 {
-		t.Fatalf("Connector stored destination for tip(%v): %v, want %v", tip2, gotAddr2, dip2)
-	}
-	gotAddr3 := c.transitIPTarget(nid, tip3)
-	if gotAddr3 != dip {
-		t.Fatalf("Connector stored destination for tip(%v): %v, want %v", tip3, gotAddr3, dip)
-	}
-}
-
-// TestHandleConnectorTransitIPRequestSameTIP tests that if we get
-// a req that has more than one TransitIPRequest for the same transit addr
-// only the first is stored, and the subsequent ones get an error code and
-// message in the response.
-func TestHandleConnectorTransitIPRequestSameTIP(t *testing.T) {
-	c := &Conn25{}
-	nid := tailcfg.NodeID(1)
-	tip := netip.MustParseAddr("0.0.0.1")
-	tip2 := netip.MustParseAddr("0.0.0.2")
-	dip := netip.MustParseAddr("1.2.3.4")
-	dip2 := netip.MustParseAddr("1.2.3.5")
-	dip3 := netip.MustParseAddr("1.2.3.6")
-	req := ConnectorTransitIPRequest{
-		TransitIPs: []TransitIPRequest{
-			{TransitIP: tip, DestinationIP: dip},
-			// cannot have dupe TransitIPs in one ConnectorTransitIPRequest
-			{TransitIP: tip, DestinationIP: dip2},
-			{TransitIP: tip2, DestinationIP: dip3},
-		},
-	}
-
-	resp := c.HandleConnectorTransitIPRequest(nid, req)
-	if len(resp.TransitIPs) != 3 {
-		t.Fatalf("n TransitIPs in response: %d, want 3", len(resp.TransitIPs))
-	}
-
-	got := resp.TransitIPs[0].Code
-	if got != TransitIPResponseCode(0) {
-		t.Fatalf("i=0 TransitIP Code: %d, want 0", got)
-	}
-	msg := resp.TransitIPs[0].Message
-	if msg != "" {
-		t.Fatalf("i=0 TransitIP Message: \"%s\", want \"%s\"", msg, "")
-	}
-	got1 := resp.TransitIPs[1].Code
-	if got1 != TransitIPResponseCode(1) {
-		t.Fatalf("i=1 TransitIP Code: %d, want 1", got1)
-	}
-	msg1 := resp.TransitIPs[1].Message
-	if msg1 != dupeTransitIPMessage {
-		t.Fatalf("i=1 TransitIP Message: \"%s\", want \"%s\"", msg1, dupeTransitIPMessage)
-	}
-	got2 := resp.TransitIPs[2].Code
-	if got2 != TransitIPResponseCode(0) {
-		t.Fatalf("i=2 TransitIP Code: %d, want 0", got2)
-	}
-	msg2 := resp.TransitIPs[2].Message
-	if msg2 != "" {
-		t.Fatalf("i=2 TransitIP Message: \"%s\", want \"%s\"", msg, "")
-	}
-
-	gotAddr1 := c.transitIPTarget(nid, tip)
-	if gotAddr1 != dip {
-		t.Fatalf("Connector stored destination for tip(%v): %v, want %v", tip, gotAddr1, dip)
-	}
-	gotAddr2 := c.transitIPTarget(nid, tip2)
-	if gotAddr2 != dip3 {
-		t.Fatalf("Connector stored destination for tip(%v): %v, want %v", tip2, gotAddr2, dip3)
-	}
-}
-
-// TestGetDstIPUnknownTIP tests that unknown transit addresses can be looked up without problem.
-func TestTransitIPTargetUnknownTIP(t *testing.T) {
-	c := &Conn25{}
-	nid := tailcfg.NodeID(1)
-	tip := netip.MustParseAddr("0.0.0.1")
-	got := c.transitIPTarget(nid, tip)
-	want := netip.Addr{}
-	if got != want {
-		t.Fatalf("Unknown transit addr, want: %v, got %v", want, got)
-	}
-}
-
-func TestPickSplitDNSPeers(t *testing.T) {
+func TestAppDNSRoutes(t *testing.T) {
 	getBytesForAttr := func(name string, domains []string, tags []string) []byte {
 		attr := appctype.AppConnectorAttr{
 			Name:       name,
@@ -208,83 +32,105 @@ func TestPickSplitDNSPeers(t *testing.T) {
 	appTwoBytes := getBytesForAttr("app2", []string{"a.example.com"}, []string{"tag:two"})
 	appThreeBytes := getBytesForAttr("app3", []string{"woo.b.example.com", "hoo.b.example.com"}, []string{"tag:three1", "tag:three2"})
 	appFourBytes := getBytesForAttr("app4", []string{"woo.b.example.com", "c.example.com"}, []string{"tag:four1", "tag:four2"})
+	appFiveBytes := getBytesForAttr("app5", []string{"*.example.com", "example.com"}, []string{"tag:one"})
+	appSixBytes := getBytesForAttr("app6", []string{"*.Example.com", "EXAMPLE.com", "EXAMPLE.COM"}, []string{"tag:one"})
 
-	makeNodeView := func(id tailcfg.NodeID, name string, tags []string) tailcfg.NodeView {
-		return (&tailcfg.Node{
-			ID:       id,
-			Name:     name,
-			Tags:     tags,
-			Hostinfo: (&tailcfg.Hostinfo{AppConnector: opt.NewBool(true)}).View(),
-		}).View()
+	resolver := func(appName string) []*dnstype.Resolver {
+		return []*dnstype.Resolver{{Addr: fmt.Sprintf("%s:%s", DNSAddrScheme, appName), UseWithExitNode: true}}
 	}
-	nvp1 := makeNodeView(1, "p1", []string{"tag:one"})
-	nvp2 := makeNodeView(2, "p2", []string{"tag:four1", "tag:four2"})
-	nvp3 := makeNodeView(3, "p3", []string{"tag:two", "tag:three1"})
-	nvp4 := makeNodeView(4, "p4", []string{"tag:two", "tag:three2", "tag:four2"})
 
 	for _, tt := range []struct {
 		name   string
-		want   map[string][]tailcfg.NodeView
-		peers  []tailcfg.NodeView
+		hasCap bool
 		config []tailcfg.RawMessage
+		want   map[string][]*dnstype.Resolver
 	}{
 		{
-			name: "empty",
+			name:   "no-capability", // hasCap false should return nil regardless of config.
+			hasCap: false,
 		},
 		{
-			name:   "bad-config", // bad config should return a nil map rather than error.
+			name:   "no-apps", // hasCap true but no configured apps returns an empty map.
+			hasCap: true,
+			want:   map[string][]*dnstype.Resolver{},
+		},
+		{
+			name:   "bad-config", // bad config should return nil rather than error.
+			hasCap: true,
 			config: []tailcfg.RawMessage{tailcfg.RawMessage(`hey`)},
 		},
 		{
-			name:   "no-peers",
+			name:   "single-app",
+			hasCap: true,
 			config: []tailcfg.RawMessage{tailcfg.RawMessage(appOneBytes)},
-		},
-		{
-			name:   "peers-that-are-not-connectors",
-			config: []tailcfg.RawMessage{tailcfg.RawMessage(appOneBytes)},
-			peers: []tailcfg.NodeView{
-				(&tailcfg.Node{
-					ID:   5,
-					Name: "p5",
-					Tags: []string{"tag:one"},
-				}).View(),
-				(&tailcfg.Node{
-					ID:   6,
-					Name: "p6",
-					Tags: []string{"tag:one"},
-				}).View(),
+			want: map[string][]*dnstype.Resolver{
+				"example.com": resolver("app1"),
 			},
 		},
 		{
-			name:   "peers-that-dont-match-tags",
-			config: []tailcfg.RawMessage{tailcfg.RawMessage(appOneBytes)},
-			peers: []tailcfg.NodeView{
-				makeNodeView(5, "p5", []string{"tag:seven"}),
-				makeNodeView(6, "p6", nil),
+			name:   "single-app-multi-domain",
+			hasCap: true,
+			config: []tailcfg.RawMessage{tailcfg.RawMessage(appThreeBytes)},
+			want: map[string][]*dnstype.Resolver{
+				"woo.b.example.com": resolver("app3"),
+				"hoo.b.example.com": resolver("app3"),
 			},
 		},
 		{
-			name: "matching-tagged-connector-peers",
+			name:   "multi-app-no-overlap",
+			hasCap: true,
 			config: []tailcfg.RawMessage{
 				tailcfg.RawMessage(appOneBytes),
 				tailcfg.RawMessage(appTwoBytes),
-				tailcfg.RawMessage(appThreeBytes),
-				tailcfg.RawMessage(appFourBytes),
 			},
-			peers: []tailcfg.NodeView{
-				nvp1,
-				nvp2,
-				nvp3,
-				nvp4,
-				makeNodeView(5, "p5", nil),
+			want: map[string][]*dnstype.Resolver{
+				"example.com":   resolver("app1"),
+				"a.example.com": resolver("app2"),
 			},
-			want: map[string][]tailcfg.NodeView{
-				// p5 has no matching tags and so doesn't appear
-				"example.com":       {nvp1},
-				"a.example.com":     {nvp3, nvp4},
-				"woo.b.example.com": {nvp2, nvp3, nvp4},
-				"hoo.b.example.com": {nvp3, nvp4},
-				"c.example.com":     {nvp2, nvp4},
+		},
+		{
+			name:   "domain-collision-last-write-wins",
+			hasCap: true,
+			config: []tailcfg.RawMessage{
+				tailcfg.RawMessage(appThreeBytes), // app3: woo.b.example.com, hoo.b.example.com
+				tailcfg.RawMessage(appFourBytes),  // app4: woo.b.example.com, c.example.com
+			},
+			want: map[string][]*dnstype.Resolver{
+				// app4 overwrites app3 for the shared domain
+				"woo.b.example.com": resolver("app4"),
+				"hoo.b.example.com": resolver("app3"),
+				"c.example.com":     resolver("app4"),
+			},
+		},
+		{
+			name:   "wildcards-are-stripped-and-deduped",
+			hasCap: true,
+			config: []tailcfg.RawMessage{tailcfg.RawMessage(appFiveBytes)},
+			want: map[string][]*dnstype.Resolver{
+				// *.example.com and example.com should both normalize to example.com.
+				"example.com": resolver("app5"),
+			},
+		},
+		{
+			name:   "domains-are-normalized-and-deduped",
+			hasCap: true,
+			config: []tailcfg.RawMessage{tailcfg.RawMessage(appSixBytes)},
+			want: map[string][]*dnstype.Resolver{
+				// *.Example.com, EXAMPLE.com, EXAMPLE.COM should all normalize to example.com.
+				"example.com": resolver("app6"),
+			},
+		},
+		{
+			name:   "sub-domains-and-top-domains-do-not-collide",
+			hasCap: true,
+			config: []tailcfg.RawMessage{
+				tailcfg.RawMessage(appTwoBytes),
+				tailcfg.RawMessage(appFiveBytes),
+			},
+			want: map[string][]*dnstype.Resolver{
+				// *.example.com normalizes to example.com; a.example.com remains distinct.
+				"a.example.com": resolver("app2"),
+				"example.com":   resolver("app5"),
 			},
 		},
 	} {
@@ -292,19 +138,15 @@ func TestPickSplitDNSPeers(t *testing.T) {
 			selfNode := &tailcfg.Node{}
 			if tt.config != nil {
 				selfNode.CapMap = tailcfg.NodeCapMap{
-					tailcfg.NodeCapability(AppConnectorsExperimentalAttrName): tt.config,
+					nodecap.Cap(AppConnectorsExperimentalAttrName): tt.config,
 				}
 			}
 			selfView := selfNode.View()
-			peers := map[tailcfg.NodeID]tailcfg.NodeView{}
-			for _, p := range tt.peers {
-				peers[p.ID()] = p
-			}
-			got := PickSplitDNSPeers(func(_ tailcfg.NodeCapability) bool {
-				return true
-			}, selfView, peers)
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("got %v, want %v", got, tt.want)
+			got := AppDNSRoutes(func(_ nodecap.Cap) bool {
+				return tt.hasCap
+			}, selfView)
+			if diff := cmp.Diff(tt.want, got); diff != "" {
+				t.Fatalf("AppDNSRoutes (-want, +got):\n%s", diff)
 			}
 		})
 	}

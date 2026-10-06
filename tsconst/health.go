@@ -23,4 +23,6 @@ const (
 	HealthWarnableTestWarnable              = "test-warnable"
 	HealthWarnableApplyDiskConfig           = "apply-disk-config"
 	HealthWarnableWarmingUp                 = "warming-up"
+	HealthWarnableTLSCertPending            = "tls-cert-pending"
+	HealthWarnableExitNodeUnavailable       = "exit-node-unavailable"
 )

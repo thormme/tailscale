@@ -1,9 +1,9 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Package udprelay contains constructs for relaying Disco and WireGuard packets
-// between Tailscale clients over UDP. This package is currently considered
-// experimental.
+// Package udprelay contains a relay server implementation for relaying Disco
+// and WireGuard packets between Tailscale clients over UDP. This relay
+// functionality is also known as Tailscale Peer Relays.
 package udprelay
 
 import (
@@ -24,7 +24,7 @@ import (
 
 	"go4.org/mem"
 	"golang.org/x/crypto/blake2s"
-	"golang.org/x/net/ipv6"
+	"tailscale.com/control/controlknobs"
 	"tailscale.com/disco"
 	"tailscale.com/net/batching"
 	"tailscale.com/net/netaddr"
@@ -83,6 +83,7 @@ type Server struct {
 	metrics             *metrics
 	netMon              *netmon.Monitor
 	cloudInfo           *cloudinfo.CloudInfo // used to query cloud metadata services
+	controlKnobs        *controlknobs.Knobs  // or nil
 
 	mu                  sync.Mutex                      // guards the following fields
 	macSecrets          views.Slice[[blake2s.Size]byte] // [0] is most recent, max 2 elements
@@ -376,8 +377,8 @@ const (
 // port selection is left up to the host networking stack. If
 // onlyStaticAddrPorts is true, then dynamic addr:port discovery will be
 // disabled, and only addr:port's set via [Server.SetStaticAddrPorts] will be
-// used. Metrics must be non-nil.
-func NewServer(logf logger.Logf, port uint16, onlyStaticAddrPorts bool, metrics *usermetric.Registry) (s *Server, err error) {
+// used. Metrics must be non-nil. knobs may be nil.
+func NewServer(logf logger.Logf, port uint16, onlyStaticAddrPorts bool, metrics *usermetric.Registry, knobs *controlknobs.Knobs) (s *Server, err error) {
 	s = &Server{
 		logf:                  logf,
 		disco:                 key.NewDisco(),
@@ -388,6 +389,7 @@ func NewServer(logf logger.Logf, port uint16, onlyStaticAddrPorts bool, metrics 
 		serverEndpointByDisco: make(map[key.SortedPairOfDiscoPublic]*serverEndpoint),
 		nextVNI:               minVNI,
 		cloudInfo:             cloudinfo.New(logf),
+		controlKnobs:          knobs,
 	}
 	s.discoPublic = s.disco.Public()
 	s.metrics = registerMetrics(metrics)
@@ -566,13 +568,14 @@ type singlePacketConn struct {
 	*net.UDPConn
 }
 
-func (c *singlePacketConn) ReadBatch(msgs []ipv6.Message, _ int) (int, error) {
-	n, ap, err := c.UDPConn.ReadFromUDPAddrPort(msgs[0].Buffers[0])
+func (c *singlePacketConn) ReadBatch(slab []byte, packets []batching.ReceivedPacket) (int, error) {
+	n, ap, err := c.UDPConn.ReadFromUDPAddrPort(slab)
 	if err != nil {
 		return 0, err
 	}
-	msgs[0].N = n
-	msgs[0].Addr = net.UDPAddrFromAddrPort(netaddr.Unmap(ap))
+	packets[0].Offset = 0
+	packets[0].Size = n
+	packets[0].Source = netaddr.Unmap(ap)
 	return 1, nil
 }
 
@@ -651,8 +654,9 @@ func trySetSOMark(logf logger.Logf, netMon *netmon.Monitor, network, address str
 // single packet syscall operations.
 func (s *Server) bindSockets(desiredPort uint16) error {
 	// maxSocketsPerAF is a conservative starting point, but is somewhat
-	// arbitrary.
-	maxSocketsPerAF := min(16, runtime.NumCPU())
+	// arbitrary. Use GOMAXPROCS rather than NumCPU as it is container-aware
+	// and respects CPU limits/quotas set via cgroups.
+	maxSocketsPerAF := min(16, runtime.GOMAXPROCS(0))
 	listenConfig := &net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			trySetReusePort(network, address, c)
@@ -688,7 +692,7 @@ func (s *Server) bindSockets(desiredPort uint16) error {
 					break SocketsLoop
 				}
 			}
-			pc := batching.TryUpgradeToConn(uc, network, batching.IdealBatchSize)
+			pc := batching.TryUpgradeToConn(uc, network, "udprelay_rxq_overflows", s.controlKnobs)
 			bc, ok := pc.(batching.Conn)
 			if !ok {
 				bc = &singlePacketConn{uc}
@@ -870,27 +874,20 @@ func (s *Server) packetReadLoop(readFromSocket, otherSocket batching.Conn, readF
 		s.Close()
 	}()
 
-	msgs := make([]ipv6.Message, batching.IdealBatchSize)
-	for i := range msgs {
-		msgs[i].OOB = make([]byte, batching.MinControlMessageSize())
-		msgs[i].Buffers = make([][]byte, 1)
-		msgs[i].Buffers[0] = make([]byte, 1<<16-1)
-	}
-	writeBuffsByDest := make(map[netip.AddrPort][][]byte, batching.IdealBatchSize)
+	slab := make([]byte, 2*batching.ReadSlabMultiple)
+	packets := make([]batching.ReceivedPacket, 2*batching.MinimumReadBatchSize)
+	writeBuffsByDest := make(map[netip.AddrPort][][]byte, batching.MaximumWriteBatchSize)
 
 	for {
-		for i := range msgs {
-			msgs[i] = ipv6.Message{Buffers: msgs[i].Buffers, OOB: msgs[i].OOB[:cap(msgs[i].OOB)]}
-		}
-
-		// TODO: extract laddr from IP_PKTINFO for use in reply
+		// TODO: extract laddr from IP_PKTINFO for use in reply, using
+		// tailscale.com/net/pktinfo.
 		// ReadBatch will split coalesced datagrams before returning, which
 		// WriteBatchTo will re-coalesce further down. We _could_ be more
 		// efficient and not split datagrams that belong to the same VNI if they
 		// are non-control/handshake packets. We pay the memmove/memcopy
 		// performance penalty for now in the interest of simple single packet
 		// handlers.
-		n, err := readFromSocket.ReadBatch(msgs, 0)
+		n, err := readFromSocket.ReadBatch(slab, packets)
 		if err != nil {
 			s.logf("error reading from socket(%v): %v", readFromSocket.LocalAddr(), err)
 			return
@@ -903,13 +900,12 @@ func (s *Server) packetReadLoop(readFromSocket, otherSocket batching.Conn, readF
 			bytes6   int64
 			packets6 int64
 		}{}
-		for _, msg := range msgs[:n] {
-			if msg.N == 0 {
+		for _, packet := range packets[:n] {
+			if packet.Size == 0 {
 				continue
 			}
-			buf := msg.Buffers[0][:msg.N]
-			from := msg.Addr.(*net.UDPAddr).AddrPort()
-			write, to, isDataPacket := s.handlePacket(from, buf)
+			buf := slab[packet.Offset : packet.Offset+packet.Size]
+			write, to, isDataPacket := s.handlePacket(packet.Source, buf)
 			if !to.IsValid() {
 				continue
 			}
@@ -922,10 +918,10 @@ func (s *Server) packetReadLoop(readFromSocket, otherSocket batching.Conn, readF
 					forwardedByOutAF.packets6++
 				}
 			}
-			if from.Addr().Is4() == to.Addr().Is4() || otherSocket != nil {
+			if packet.Source.Addr().Is4() == to.Addr().Is4() || otherSocket != nil {
 				buffs, ok := writeBuffsByDest[to]
 				if !ok {
-					buffs = make([][]byte, 0, batching.IdealBatchSize)
+					buffs = make([][]byte, 0, batching.MaximumWriteBatchSize)
 				}
 				buffs = append(buffs, write)
 				writeBuffsByDest[to] = buffs
@@ -935,7 +931,7 @@ func (s *Server) packetReadLoop(readFromSocket, otherSocket batching.Conn, readF
 				// [server.handlePacket] has to see a packet from a particular
 				// address family at least once in order for it to return a
 				// packet to write towards a dest for the same address family.
-				s.logf("[unexpected] packet from: %v produced packet to: %v while otherSocket is nil", from, to)
+				s.logf("[unexpected] packet from: %v produced packet to: %v while otherSocket is nil", packet.Source, to)
 			}
 		}
 
@@ -976,7 +972,7 @@ func (e ErrServerNotReady) Error() string {
 // For now, we favor simplicity and reducing VNI re-use over more complex
 // ephemeral port (VNI) selection algorithms.
 func (s *Server) getNextVNILocked() (uint32, error) {
-	for i := uint32(0); i < totalPossibleVNI; i++ {
+	for range totalPossibleVNI {
 		vni := s.nextVNI
 		if vni == maxVNI {
 			s.nextVNI = minVNI
@@ -1011,6 +1007,14 @@ func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.Serv
 	defer s.mu.Unlock()
 	if s.closed {
 		return endpoint.ServerEndpoint{}, ErrServerClosed
+	}
+
+	if discoA.IsZero() || discoB.IsZero() {
+		// DiscoPrivate.Shared, called below for each client key, rejects
+		// zero keys. A zero key indicates a malformed or malicious
+		// [disco.AllocateUDPRelayEndpointRequest], whose ClientDisco values
+		// are attacker-chosen.
+		return endpoint.ServerEndpoint{}, errors.New("zero client disco key")
 	}
 
 	if s.staticAddrPorts.Len() == 0 && len(s.dynamicAddrPorts) == 0 {

@@ -8,6 +8,7 @@ package tka
 import (
 	"crypto/ed25519"
 	"errors"
+	"time"
 
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -149,7 +150,7 @@ func DecodeWrappedAuthkey(wrappedAuthKey string, logf logger.Logf) (authKey stri
 	return wrappedAuthKey, false, nil, nil
 }
 
-func ResignNKS(priv key.NLPrivate, nodeKey key.NodePublic, oldNKS tkatype.MarshaledSignature) (tkatype.MarshaledSignature, error) {
+func ResignNKS(priv key.TLPrivate, nodeKey key.NodePublic, oldNKS tkatype.MarshaledSignature) (tkatype.MarshaledSignature, error) {
 	return nil, nil
 }
 
@@ -158,3 +159,8 @@ func SignByCredential(privKey []byte, wrapped *NodeKeySignature, nodeKey key.Nod
 }
 
 func (s NodeKeySignature) String() string { return "" }
+
+type CompactionOptions struct {
+	MinChain int
+	MinAge   time.Duration
+}

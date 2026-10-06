@@ -4,65 +4,61 @@
 package wgcfg
 
 import (
-	"errors"
-	"io"
-	"sort"
+	"fmt"
 
 	"github.com/tailscale/wireguard-go/conn"
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/clientmetric"
 )
 
 // NewDevice returns a wireguard-go Device configured for Tailscale use.
 func NewDevice(tunDev tun.Device, bind conn.Bind, logger *device.Logger) *device.Device {
-	ret := device.NewDevice(tunDev, bind, logger)
-	ret.DisableSomeRoamingForBrokenMobileSemantics()
-	return ret
+	return device.NewDevice(tunDev, bind, logger, append(getMemoryOptions(), getDeviceMetrics())...)
 }
 
-func DeviceConfig(d *device.Device) (*Config, error) {
-	r, w := io.Pipe()
-	errc := make(chan error, 1)
-	go func() {
-		errc <- d.IpcGetOperation(w)
-		w.Close()
-	}()
-	cfg, fromErr := FromUAPI(r)
-	r.Close()
-	getErr := <-errc
-	err := errors.Join(getErr, fromErr)
-	if err != nil {
-		return nil, err
-	}
-	sort.Slice(cfg.Peers, func(i, j int) bool {
-		return cfg.Peers[i].PublicKey.Less(cfg.Peers[j].PublicKey)
+func getDeviceMetrics() device.Option {
+	return device.WithMetrics(device.Metrics{
+		MessageInitiationTXAttemptInitial: metricMessageInitiationTXAttemptInitial,
+		MessageInitiationTXAttemptRetry:   metricMessageInitiationTXAttemptRetry,
+		MessageResponseTXAttempt:          metricMessageResponseTXAttempt,
+		MessageCookieReplyTXAttempt:       metricMessageCookieReplyTXAttempt,
+		HandshakeInitiatorCompleted:       metricHandshakeInitiatorCompleted,
+		HandshakeResponderCompleted:       metricHandshakeResponderCompleted,
+		MessageTransportRXDroppedReplay:   metricMessageTransportRXDroppedReplay,
 	})
-	return cfg, nil
 }
 
-// ReconfigDevice replaces the existing device configuration with cfg.
-func ReconfigDevice(d *device.Device, cfg *Config, logf logger.Logf) (err error) {
-	defer func() {
-		if err != nil {
-			logf("wgcfg.Reconfig failed: %v", err)
+var (
+	metricMessageInitiationTXAttemptInitial = clientmetric.NewCounter("wireguard_message_initiation_tx_attempt_initial")
+	metricMessageInitiationTXAttemptRetry   = clientmetric.NewCounter("wireguard_message_initiation_tx_attempt_retry")
+	metricMessageResponseTXAttempt          = clientmetric.NewCounter("wireguard_message_response_tx_attempt")
+	metricMessageCookieReplyTXAttempt       = clientmetric.NewCounter("wireguard_message_cookie_reply_tx_attempt")
+	metricHandshakeInitiatorCompleted       = clientmetric.NewCounter("wireguard_handshake_initiator_completed")
+	metricHandshakeResponderCompleted       = clientmetric.NewCounter("wireguard_handshake_responder_completed")
+	metricMessageTransportRXDroppedReplay   = clientmetric.NewCounter("wireguard_message_transport_rx_dropped_replay")
+)
+
+// NewPeerLookupFunc returns a [device.PeerLookupFunc] that lazily
+// creates peers using peerConfig as the source of each peer's allowed IPs and
+// optional pre-shared key. The peer's endpoint is derived from its public key
+// via bind.
+func NewPeerLookupFunc(bind conn.Bind, logf logger.Logf, peerConfig func(device.NoisePublicKey) (PeerConfig, bool)) device.PeerLookupFunc {
+	return func(pubk device.NoisePublicKey) (_ *device.NewPeerConfig, ok bool) {
+		conf, ok := peerConfig(pubk)
+		if !ok {
+			return nil, false
 		}
-	}()
-
-	prev, err := DeviceConfig(d)
-	if err != nil {
-		return err
+		ep, err := bind.ParseEndpoint(fmt.Sprintf("%x", pubk[:]))
+		if err != nil {
+			logf("wgcfg: failed to parse endpoint for peer %x: %v", pubk[:8], err)
+			return nil, false
+		}
+		return &device.NewPeerConfig{
+			AllowedIPs:   conf.AllowedIPs,
+			PresharedKey: conf.PresharedKey,
+			Endpoint:     ep,
+		}, true
 	}
-
-	r, w := io.Pipe()
-	errc := make(chan error, 1)
-	go func() {
-		errc <- d.IpcSetOperation(r)
-		r.Close()
-	}()
-
-	toErr := cfg.ToUAPI(logf, w, prev)
-	w.Close()
-	setErr := <-errc
-	return errors.Join(setErr, toErr)
 }

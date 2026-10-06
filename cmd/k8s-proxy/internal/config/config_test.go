@@ -20,7 +20,6 @@ import (
 	ktesting "k8s.io/client-go/testing"
 	"tailscale.com/kube/k8s-proxy/conf"
 	"tailscale.com/kube/kubetypes"
-	"tailscale.com/types/ptr"
 )
 
 func TestWatchConfig(t *testing.T) {
@@ -52,7 +51,7 @@ func TestWatchConfig(t *testing.T) {
 					initialConfig: `{"version": "v1alpha1", "authKey": "abc123"}`,
 					phases: []phase{{
 						expectedConf: &conf.ConfigV1Alpha1{
-							AuthKey: ptr.To("abc123"),
+							AuthKey: new("abc123"),
 						},
 					}},
 				},
@@ -62,7 +61,7 @@ func TestWatchConfig(t *testing.T) {
 					phases: []phase{
 						{
 							expectedConf: &conf.ConfigV1Alpha1{
-								AuthKey: ptr.To("abc123"),
+								AuthKey: new("abc123"),
 							},
 						},
 						{
@@ -76,13 +75,13 @@ func TestWatchConfig(t *testing.T) {
 					phases: []phase{
 						{
 							expectedConf: &conf.ConfigV1Alpha1{
-								AuthKey: ptr.To("abc123"),
+								AuthKey: new("abc123"),
 							},
 						},
 						{
 							config: `{"version": "v1alpha1", "authKey": "def456"}`,
 							expectedConf: &conf.ConfigV1Alpha1{
-								AuthKey: ptr.To("def456"),
+								AuthKey: new("def456"),
 							},
 						},
 					},
@@ -93,7 +92,7 @@ func TestWatchConfig(t *testing.T) {
 					phases: []phase{
 						{
 							expectedConf: &conf.ConfigV1Alpha1{
-								AuthKey: ptr.To("abc123"),
+								AuthKey: new("abc123"),
 							},
 						},
 						{
@@ -144,27 +143,36 @@ func TestWatchConfig(t *testing.T) {
 							cancel()
 						}
 
-						select {
-						case cfg := <-configChan:
-							if diff := cmp.Diff(*p.expectedConf, cfg.Parsed); diff != "" {
-								t.Errorf("unexpected config (-want +got):\n%s", diff)
-							}
-						case err := <-errs:
-							if p.cancel {
-								if err != nil {
-									t.Fatalf("unexpected error after cancel: %v", err)
+						timeout := time.After(5 * time.Second)
+					waitPhase:
+						for {
+							select {
+							case cfg := <-configChan:
+								if diff := cmp.Diff(*p.expectedConf, cfg.Parsed); diff != "" {
+									t.Errorf("unexpected config (-want +got):\n%s", diff)
 								}
-							} else if p.expectedErr == "" {
-								t.Fatalf("unexpected error: %v", err)
-							} else if !strings.Contains(err.Error(), p.expectedErr) {
-								t.Fatalf("expected error to contain %q, got %q", p.expectedErr, err.Error())
+							case err := <-errs:
+								if p.cancel {
+									if err != nil {
+										t.Fatalf("unexpected error after cancel: %v", err)
+									}
+								} else if p.expectedErr == "" {
+									t.Fatalf("unexpected error: %v", err)
+								} else if !strings.Contains(err.Error(), p.expectedErr) {
+									t.Fatalf("expected error to contain %q, got %q", p.expectedErr, err.Error())
+								}
+							case <-loader.cfgIgnored:
+								if p.expectedConf != nil {
+									// A watch started without a resource version
+									// replays the existing Secret as an Added
+									// event, which the loader rightly ignores as
+									// a no-op. Keep waiting for the real reload.
+									continue
+								}
+							case <-timeout:
+								t.Fatalf("timed out waiting for expected event in phase: %d", i)
 							}
-						case <-loader.cfgIgnored:
-							if p.expectedConf != nil {
-								t.Fatalf("expected config to be reloaded, but got ignored signal")
-							}
-						case <-time.After(5 * time.Second):
-							t.Fatalf("timed out waiting for expected event in phase: %d", i)
+							break waitPhase
 						}
 					}
 				})

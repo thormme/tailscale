@@ -17,6 +17,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -27,7 +28,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	wgconn "github.com/tailscale/wireguard-go/conn"
 	"github.com/tailscale/wireguard-go/device"
 	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/netipx"
@@ -35,6 +35,7 @@ import (
 	"tailscale.com/derp"
 	"tailscale.com/derp/derphttp"
 	"tailscale.com/net/netmon"
+	"tailscale.com/net/netutil"
 	"tailscale.com/net/stun"
 	"tailscale.com/net/tstun"
 	"tailscale.com/syncs"
@@ -197,7 +198,7 @@ func (d *derpProber) probeMapFn(ctx context.Context) error {
 		for _, server := range region.Nodes {
 			labels := Labels{
 				"region":    region.RegionCode,
-				"region_id": strconv.Itoa(region.RegionID),
+				"region_id": region.RegionID.String(),
 				"hostname":  server.HostName,
 			}
 
@@ -423,7 +424,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 	// for packets up to their timeout. As records age out of the front of this
 	// list, if the associated packet arrives, we won't have a txRecord for it
 	// and will consider it to have timed out.
-	txRecords := make([]txRecord, 0, packetsPerSecond*int(packetTimeout.Seconds()))
+	txRecords := make([]txRecord, 0, int(math.Ceil(float64(packetsPerSecond)*packetTimeout.Seconds()))+1)
 	var txRecordsMu sync.Mutex
 
 	// applyTimeouts walks over txRecords and expires any records that are older
@@ -435,7 +436,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 		now := time.Now()
 		recs := txRecords[:0]
 		for _, r := range txRecords {
-			if now.Sub(r.at) > packetTimeout {
+			if now.Sub(r.at) >= packetTimeout {
 				packetsDropped.Add(1)
 			} else {
 				recs = append(recs, r)
@@ -451,9 +452,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 	pkt := make([]byte, 260) // the same size as a CallMeMaybe packet observed on a Tailscale client.
 	crand.Read(pkt)
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		t := time.NewTicker(time.Second / time.Duration(packetsPerSecond))
 		defer t.Stop()
 
@@ -481,13 +480,11 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 				}
 			}
 		}
-	}()
+	})
 
 	// Receive the packets.
 	recvFinishedC := make(chan error, 1)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		defer close(recvFinishedC) // to break out of 'select' below.
 		fromDERPPubKey := fromc.SelfPublicKey()
 		for {
@@ -531,7 +528,7 @@ func runDerpProbeQueuingDelayContinously(ctx context.Context, from, to *tailcfg.
 				// Loop.
 			}
 		}
-	}()
+	})
 
 	select {
 	case <-ctx.Done():
@@ -645,7 +642,7 @@ func (d *derpProber) ProbeUDP(ipaddr string, port int) ProbeClass {
 }
 
 func (d *derpProber) skipRegion(region *tailcfg.DERPRegion) bool {
-	return d.regionCodeOrID != "" && region.RegionCode != d.regionCodeOrID && strconv.Itoa(region.RegionID) != d.regionCodeOrID
+	return d.regionCodeOrID != "" && region.RegionCode != d.regionCodeOrID && region.RegionID.String() != d.regionCodeOrID
 }
 
 func derpProbeUDP(ctx context.Context, ipStr string, port int) error {
@@ -946,11 +943,6 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 		return fmt.Errorf("failed to configure tun: %w", err)
 	}
 
-	// Depending on platform, we need some space for headers at the front
-	// of TUN I/O op buffers. The below constant is more than enough space
-	// for any platform that this might run on.
-	tunStartOffset := device.MessageTransportHeaderSize
-
 	// This goroutine reads packets from the TUN device and evaluates if they
 	// are IPv4 packets destined for loopback via DERP. If so, it performs L3 NAT
 	// (swap src/dst) and writes them towards DERP in order to loopback via the
@@ -960,25 +952,21 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 	go func() {
 		defer wg.Done()
 
-		numBufs := wgconn.IdealBatchSize
-		bufs := make([][]byte, 0, numBufs)
-		sizes := make([]int, numBufs)
-		for range numBufs {
-			bufs = append(bufs, make([]byte, mtu+tunStartOffset))
-		}
+		slab := make([]byte, 2*(1<<16-1)+(2*tun.ReadPacketSpacing))
+		packets := make([]tun.ReadPacket, dev.BatchSize())
 
 		destinationAddrBytes := destinationAddr.AsSlice()
 		scratch := make([]byte, 4)
 		toDERPPubKey := toc.SelfPublicKey()
 		for {
-			n, err := dev.Read(bufs, sizes, tunStartOffset)
+			n, err := dev.Read(slab, packets)
 			if err != nil {
 				tunReadErrC <- err
 				return
 			}
 
-			for i := range n {
-				pkt := bufs[i][tunStartOffset : sizes[i]+tunStartOffset]
+			for _, metadata := range packets[:n] {
+				pkt := slab[metadata.Offset : metadata.Offset+metadata.Size]
 				// Skip everything except valid IPv4 packets
 				if len(pkt) < 20 {
 					// Doesn't even have a full IPv4 header
@@ -1013,7 +1001,11 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 	go func() {
 		defer wg.Done()
 
-		buf := make([]byte, mtu+tunStartOffset)
+		// Depending on platform, we need some space for headers at the front
+		// of TUN I/O op buffers. The below constant is more than enough space
+		// for any platform that this might run on.
+		tunWriteStartOffset := device.MessageTransportHeaderSize
+		buf := make([]byte, mtu+tunWriteStartOffset)
 		bufs := make([][]byte, 1)
 
 		fromDERPPubKey := fromc.SelfPublicKey()
@@ -1030,9 +1022,9 @@ func derpProbeBandwidthTUN(ctx context.Context, transferTimeSeconds, totalBytesT
 					return
 				}
 				pkt := v.Data
-				copy(buf[tunStartOffset:], pkt)
-				bufs[0] = buf[:len(pkt)+tunStartOffset]
-				if _, err := dev.Write(bufs, tunStartOffset); err != nil {
+				copy(buf[tunWriteStartOffset:], pkt)
+				bufs[0] = buf[:len(pkt)+tunWriteStartOffset]
+				if _, err := dev.Write(bufs, tunWriteStartOffset); err != nil {
 					recvErrC <- fmt.Errorf("failed to write to TUN device: %w", err)
 					return
 				}
@@ -1213,7 +1205,7 @@ func newConn(ctx context.Context, dm *tailcfg.DERPMap, n *tailcfg.DERPNode, isPr
 var httpOrFileClient = &http.Client{Transport: httpOrFileTransport()}
 
 func httpOrFileTransport() http.RoundTripper {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr := netutil.NewDefaultTransport()
 	tr.RegisterProtocol("file", http.NewFileTransport(http.Dir("/")))
 	return tr
 }

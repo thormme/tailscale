@@ -32,7 +32,6 @@ type Config struct {
 	BaseURL        string          // if empty defaults to "https://log.tailscale.com"
 	HTTPC          *http.Client    // if empty defaults to http.DefaultClient
 	SkipClientTime bool            // if true, client_time is not written to logs
-	LowMemory      bool            // if true, logtail minimizes memory use
 	Clock          tstime.Clock    // if set, Clock.Now substitutes uses of time.Now
 	Stderr         io.Writer       // if set, logs are sent here instead of os.Stderr
 	Bus            *eventbus.Bus   // if set, uses the eventbus for awaitInternetUp instead of callback
@@ -64,4 +63,12 @@ type Config struct {
 	// being included in the logs. The sequence number is incremented for each
 	// log message sent, but is not persisted across process restarts.
 	IncludeProcSequence bool
+
+	// Disabled, if true, causes the returned [Logger] to start in the
+	// disabled state, dropping entries without buffering or uploading
+	// (equivalent to calling [Logger.SetEnabled] with false immediately).
+	// It applies before the internal startup banner is written, so no
+	// log entries are emitted until [Logger.SetEnabled] is called with
+	// true. The process-wide [Disable] kill switch still takes precedence.
+	Disabled bool
 }

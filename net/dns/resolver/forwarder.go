@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -41,8 +42,10 @@ import (
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/nettype"
+	"tailscale.com/types/views"
 	"tailscale.com/util/cloudenv"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/mak"
 	"tailscale.com/util/race"
 	"tailscale.com/version"
 )
@@ -323,6 +326,30 @@ type forwarder struct {
 	// /etc/resolv.conf is missing/corrupt, and the peerapi ExitDNS stub
 	// resolver lookup.
 	cloudHostFallback []resolverAndDelay
+
+	// schemes are the collection of registered URI scheme names that
+	// dynamically decide which resolver to use at the time of each query. The
+	// key is the scheme (the portion before the first `:`) and the value is a
+	// handler that determines where the current query should be sent.
+	// Use schemeCacheLocked() to get the current contents that can continue to
+	// be accessed once mu is released. This allows the (much more common)
+	// resolver code path to avoid repeated locking and unlocking.
+	// When modified, call invalidateSchemeCacheLocked() before unlocking mu.
+	schemes map[string]CustomSchemeHandler
+	// schemeCache is an immutable copy of schemes. Do not read directly,
+	// use schemeCacheLocked() which will regenerate its contents as needed.
+	schemeCache views.Map[string, CustomSchemeHandler]
+
+	// acceptDNS tracks the CorpDNS pref (--accept-dns)
+	// This lets us skip health warnings if the forwarder receives inbound
+	// queries directly - but we didn't configure it with any upstream resolvers.
+	// That's an error, but not a health error if the user has disabled CorpDNS.
+	acceptDNS bool
+}
+
+func (f *forwarder) probeLocks() {
+	f.mu.Lock()
+	f.mu.Unlock()
 }
 
 func newForwarder(logf logger.Logf, netMon *netmon.Monitor, linkSel ForwardLinkSelector, dialer *tsdial.Dialer, health *health.Tracker, knobs *controlknobs.Knobs) *forwarder {
@@ -434,7 +461,7 @@ func cloudResolvers() []resolverAndDelay {
 // Resolver.SetConfig on reconfig.
 //
 // The memory referenced by routesBySuffix should not be modified.
-func (f *forwarder) setRoutes(routesBySuffix map[dnsname.FQDN][]*dnstype.Resolver) {
+func (f *forwarder) setRoutes(routesBySuffix map[dnsname.FQDN][]*dnstype.Resolver, acceptDNS bool) {
 	routes := make([]route, 0, len(routesBySuffix))
 
 	cloudHostFallback := cloudResolvers()
@@ -468,6 +495,7 @@ func (f *forwarder) setRoutes(routesBySuffix map[dnsname.FQDN][]*dnstype.Resolve
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.acceptDNS = acceptDNS
 	f.routes = routes
 	f.cloudHostFallback = cloudHostFallback
 }
@@ -504,6 +532,62 @@ func (f *forwarder) getKnownDoHClientForProvider(urlBase string) (c *http.Client
 	if len(allIPs) == 0 {
 		return nil, false
 	}
+	return f.newDoHClientLocked(urlBase, urlBase, allIPs)
+}
+
+// getDoHClientForResolver returns an HTTP client for the DoH server described
+// by r. Known public providers ([publicdns.DoHIPsOfBase]) work as before. For
+// arbitrary providers — typically enterprise resolvers recovered from the
+// OS's base configuration — the resolver must either carry a
+// BootstrapResolution, or its URL host must be an IP literal (which needs no
+// bootstrap): we cannot resolve the DoH server's own name through DNS without
+// recursing through ourselves.
+func (f *forwarder) getDoHClientForResolver(r *dnstype.Resolver) (c *http.Client, ok bool) {
+	urlBase := r.Addr
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := dohClientCacheKey(urlBase, r.BootstrapResolution)
+	if c, ok := f.dohClient[key]; ok {
+		return c, true
+	}
+	allIPs := publicdns.DoHIPsOfBase(urlBase)
+	if len(allIPs) == 0 {
+		if len(r.BootstrapResolution) > 0 {
+			allIPs = r.BootstrapResolution
+		} else {
+			// A URL whose host is an IP literal dials itself; no bootstrap
+			// resolution is needed.
+			u, err := url.Parse(urlBase)
+			if err != nil {
+				return nil, false
+			}
+			ip, err := netip.ParseAddr(u.Hostname())
+			if err != nil {
+				return nil, false
+			}
+			allIPs = []netip.Addr{ip}
+		}
+	}
+	return f.newDoHClientLocked(key, urlBase, allIPs)
+}
+
+// dohClientCacheKey distinguishes cached clients: bootstrap results can change
+// with the underlying network, unlike known public provider IPs.
+func dohClientCacheKey(urlBase string, bootstrap []netip.Addr) string {
+	if len(bootstrap) == 0 || len(publicdns.DoHIPsOfBase(urlBase)) > 0 {
+		return urlBase
+	}
+	ips := make([]string, len(bootstrap))
+	for i, ip := range bootstrap {
+		ips[i] = ip.String()
+	}
+	return urlBase + "\x00" + strings.Join(ips, ",")
+}
+
+// newDoHClientLocked builds a DoH HTTP client that dials urlBase's host at
+// the given IPs, caching the client under cacheKey (which differs from
+// urlBase when bootstrap results vary). f.mu must be held.
+func (f *forwarder) newDoHClientLocked(cacheKey, urlBase string, allIPs []netip.Addr) (c *http.Client, ok bool) {
 	dohURL, err := url.Parse(urlBase)
 	if err != nil {
 		return nil, false
@@ -539,7 +623,7 @@ func (f *forwarder) getKnownDoHClientForProvider(urlBase string) (c *http.Client
 	if f.dohClient == nil {
 		f.dohClient = map[string]*http.Client{}
 	}
-	f.dohClient[urlBase] = c
+	f.dohClient[cacheKey] = c
 	return c, true
 }
 
@@ -618,15 +702,14 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 		return res, nil
 	}
 	if strings.HasPrefix(rr.name.Addr, "https://") {
-		// Only known DoH providers are supported currently. Specifically, we
-		// only support DoH providers where we can TCP connect to them on port
-		// 443 at the same IP address they serve normal UDP DNS from (1.1.1.1,
-		// 8.8.8.8, 9.9.9.9, etc.) That's why OpenDNS and custom DoH providers
-		// aren't currently supported. There's no backup DNS resolution path for
-		// them.
-		urlBase := rr.name.Addr
-		if hc, ok := f.getKnownDoHClientForProvider(urlBase); ok {
-			res, err := f.sendDoH(ctx, urlBase, hc, fq.packet)
+		// Known DoH providers (see tailscale.com/net/dns/publicdns) are dialed
+		// at their well-known IPs. Arbitrary providers — typically enterprise
+		// resolvers recovered from the OS's base DNS configuration — are only
+		// usable when the resolver carries a bootstrap resolution, or when the
+		// URL's host is an IP literal, since we cannot resolve the DoH
+		// server's own name through DNS without recursing through ourselves.
+		if hc, ok := f.getDoHClientForResolver(rr.name); ok {
+			res, err := f.sendDoH(ctx, rr.name.Addr, hc, fq.packet)
 			if err != nil {
 				return nil, err
 			}
@@ -635,7 +718,7 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 			return res, nil
 		}
 		metricDNSFwdErrorType.Add(1)
-		return nil, fmt.Errorf("arbitrary https:// resolvers not supported yet")
+		return nil, fmt.Errorf("cannot dial https:// resolver %q: no known IPs or bootstrap resolution", rr.name.Addr)
 	}
 	if strings.HasPrefix(rr.name.Addr, "tls://") {
 		metricDNSFwdErrorType.Add(1)
@@ -720,8 +803,7 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 	}
 
 	// If we got a truncated UDP response, return that instead of an error.
-	var trErr truncatedResponseError
-	if errors.As(err, &trErr) {
+	if trErr, ok := errors.AsType[truncatedResponseError](err); ok {
 		return trErr.res, nil
 	}
 	return nil, err
@@ -733,6 +815,27 @@ type truncatedResponseError struct {
 
 func (tr truncatedResponseError) Error() string { return "response truncated" }
 
+// rcodeResponseError is returned when an upstream DNS server responds with an
+// rcode that is treated as a soft error (currently REFUSED and SERVFAIL). The
+// response bytes are preserved so they can be returned to the client rather
+// than synthesizing a new response.
+type rcodeResponseError struct {
+	rcode dns.RCode
+	res   []byte
+}
+
+func (r rcodeResponseError) Error() string { return r.Unwrap().Error() }
+func (r rcodeResponseError) Unwrap() error {
+	switch r.rcode {
+	case dns.RCodeRefused:
+		return errRefused
+	case dns.RCodeServerFailure:
+		return errServerFailure
+	}
+	return nil
+}
+
+var errRefused = errors.New("response code indicates refusal")
 var errServerFailure = errors.New("response code indicates server issue")
 var errTxIDMismatch = errors.New("txid doesn't match")
 
@@ -745,19 +848,8 @@ func (f *forwarder) sendUDP(ctx context.Context, fq *forwardQuery, rr resolverAn
 	metricDNSFwdUDP.Add(1)
 	ctx = sockstats.WithSockStats(ctx, sockstats.LabelDNSForwarderUDP, f.logf)
 
-	ln, err := f.packetListener(ipp.Addr())
+	conn, err := f.dialUDP(ctx, ipp)
 	if err != nil {
-		return nil, err
-	}
-
-	// Specify the exact UDP family to work around https://github.com/golang/go/issues/52264
-	udpFam := "udp4"
-	if ipp.Addr().Is6() {
-		udpFam = "udp6"
-	}
-	conn, err := ln.ListenPacket(ctx, udpFam, ":0")
-	if err != nil {
-		f.logf("ListenPacket failed: %v", err)
 		return nil, err
 	}
 	defer conn.Close()
@@ -776,40 +868,67 @@ func (f *forwarder) sendUDP(ctx context.Context, fq *forwardQuery, rr resolverAn
 
 	// The 1 extra byte is to detect packet truncation.
 	out := make([]byte, maxResponseBytes+1)
-	n, _, err := conn.ReadFromUDPAddrPort(out)
-	if err != nil {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+
+	// The conn is unconnected (see dialUDP), so datagrams can arrive from
+	// any address, not just the resolver we queried. A reply must come
+	// from the resolver's address and carry the transaction ID we sent.
+	// Datagrams that are neither are dropped rather than acted on, so
+	// neither a spoofed reply nor a single stray datagram can decide the
+	// query. The loop ends when the conn is closed, which the query's
+	// context cancellation does via fq.closeOnCtxDone.
+	var n int
+	for {
+		var src netip.AddrPort
+		var err error
+		n, src, err = conn.ReadFromUDPAddrPort(out)
+		if err != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if !neterror.PacketWasTruncated(err) {
+				metricDNSFwdUDPErrorRead.Add(1)
+				return nil, err
+			}
+			// Windows reports a datagram larger than out as a
+			// truncation error, returning the bytes that fit in
+			// out but no source address. Fall through and let the
+			// txid check decide, since the source can't be checked.
+		} else if src != ipp {
+			// Not from the resolver we asked, so not a reply to
+			// this query.
+			metricDNSFwdUDPDropSrc.Add(1)
+			continue
 		}
-		if neterror.PacketWasTruncated(err) {
-			err = nil
-		} else {
-			metricDNSFwdUDPErrorRead.Add(1)
-			return nil, err
+		if n < headerBytes {
+			f.logf("recv: packet too small (%d bytes)", n)
+			continue
 		}
+		if getTxID(out[:n]) != fq.txid {
+			metricDNSFwdUDPErrorTxID.Add(1)
+			continue
+		}
+		break
 	}
 	truncated := n > maxResponseBytes
 	if truncated {
 		n = maxResponseBytes
 	}
-	if n < headerBytes {
-		f.logf("recv: packet too small (%d bytes)", n)
-	}
 	out = out[:n]
 	tcFlagAlreadySet := truncatedFlagSet(out)
 
-	txid := getTxID(out)
-	if txid != fq.txid {
-		metricDNSFwdUDPErrorTxID.Add(1)
-		return nil, errTxIDMismatch
-	}
 	rcode := getRCode(out)
 
 	// don't forward transient errors back to the client when the server fails
-	if rcode == dns.RCodeServerFailure {
-		f.logf("recv: response code indicating server failure: %d", rcode)
+	switch rcode {
+	case dns.RCodeServerFailure:
+		f.logf("sendUDP: response code indicating server failure: %d", rcode)
 		metricDNSFwdUDPErrorServer.Add(1)
-		return nil, errServerFailure
+		return nil, rcodeResponseError{dns.RCodeServerFailure, out}
+	case dns.RCodeRefused:
+		// treat REFUSED as a soft error so other resolvers in the race can respond
+		f.logf("sendUDP: response code indicating refusal: %d", rcode)
+		metricDNSFwdUDPErrorRefused.Add(1)
+		return nil, rcodeResponseError{dns.RCodeRefused, out}
 	}
 
 	// Set the truncated bit if buffer was truncated during read and the flag isn't already set
@@ -834,6 +953,58 @@ func (f *forwarder) sendUDP(ctx context.Context, fq *forwardQuery, rr resolverAn
 	return out, nil
 }
 
+// dialUDP returns a UDP conn to ipp, over netstack if that's the only way to
+// reach it. Same dispatch as [tsdial.Dialer.dialOneUser].
+func (f *forwarder) dialUDP(ctx context.Context, ipp netip.AddrPort) (nettype.PacketConn, error) {
+	if f.dialer.UseNetstackForIP != nil && f.dialer.UseNetstackForIP(ipp.Addr()) {
+		if f.dialer.NetstackDialUDP == nil {
+			return nil, errors.New("dialer not initialized correctly: no NetstackDialUDP")
+		}
+		conn, err := f.dialer.NetstackDialUDP(ctx, ipp)
+		if err != nil {
+			return nil, err
+		}
+		return &netstackPacketConn{Conn: conn, peer: ipp}, nil
+	}
+
+	ln, err := f.packetListener(ipp.Addr())
+	if err != nil {
+		return nil, err
+	}
+
+	// Name the family explicitly: netns looks for a "6" in this string to
+	// choose between IP_BOUND_IF and IPV6_BOUND_IF on macOS, and "udp" would
+	// give a v6 socket bound with the v4 option.
+	udpFam := "udp4"
+	if ipp.Addr().Is6() {
+		udpFam = "udp6"
+	}
+	conn, err := ln.ListenPacket(ctx, udpFam, ":0")
+	if err != nil {
+		f.logf("ListenPacket failed: %v", err)
+		return nil, err
+	}
+	return conn, nil
+}
+
+// netstackPacketConn presents a conn already connected to peer as a
+// [nettype.PacketConn].
+type netstackPacketConn struct {
+	net.Conn
+	peer netip.AddrPort
+}
+
+func (c *netstackPacketConn) WriteToUDPAddrPort(b []byte, _ netip.AddrPort) (int, error) {
+	return c.Write(b)
+}
+
+// ReadFromUDPAddrPort returns how much of the datagram fit in b; gVisor drops
+// the rest without erroring, as a kernel socket does.
+func (c *netstackPacketConn) ReadFromUDPAddrPort(b []byte) (int, netip.AddrPort, error) {
+	n, err := c.Read(b)
+	return n, c.peer, err
+}
+
 var optDNSForwardUseRoutes = envknob.RegisterOptBool("TS_DEBUG_DNS_FORWARD_USE_ROUTES")
 
 // ShouldUseRoutes reports whether the DNS resolver should consider routes when dialing
@@ -854,7 +1025,7 @@ func ShouldUseRoutes(knobs *controlknobs.Knobs) bool {
 	switch runtime.GOOS {
 	case "android", "ios":
 		// On mobile platforms with lower memory limits (e.g., 50MB on iOS),
-		// this behavior is still gated by the "user-dial-routes" nodeAttr.
+		// this behavior is still gated by the "user-dial-routes" nodecap.
 		return knobs != nil && knobs.UserDialUseRoutes.Load()
 	default:
 		// On all other platforms, it is the default behavior,
@@ -945,10 +1116,16 @@ func (f *forwarder) sendTCP(ctx context.Context, fq *forwardQuery, rr resolverAn
 	rcode := getRCode(out)
 
 	// don't forward transient errors back to the client when the server fails
-	if rcode == dns.RCodeServerFailure {
+	switch rcode {
+	case dns.RCodeServerFailure:
 		f.logf("sendTCP: response code indicating server failure: %d", rcode)
 		metricDNSFwdTCPErrorServer.Add(1)
-		return nil, errServerFailure
+		return nil, rcodeResponseError{dns.RCodeServerFailure, out}
+	case dns.RCodeRefused:
+		// treat REFUSED as a soft error so other resolvers in the race can respond
+		f.logf("sendTCP: response code indicating refusal: %d", rcode)
+		metricDNSFwdTCPErrorRefused.Add(1)
+		return nil, rcodeResponseError{dns.RCodeRefused, out}
 	}
 
 	// TODO(andrew): do we need to do this?
@@ -957,15 +1134,66 @@ func (f *forwarder) sendTCP(ctx context.Context, fq *forwardQuery, rr resolverAn
 	return out, nil
 }
 
+// applySchemes resolves any custom-scheme entries in rrs using the provided
+// scheme handlers, returning the resulting slice. Entries whose handler returns
+// an error or empty string are dropped. Entries with no registered scheme pass
+// through unchanged. If schemes is nil, rrs is returned as-is.
+func applySchemes(logf logger.Logf, rrs []resolverAndDelay, schemes views.Map[string, CustomSchemeHandler]) []resolverAndDelay {
+	if schemes.IsNil() {
+		return rrs
+	}
+	var result []resolverAndDelay
+	for i, rr := range rrs {
+		scheme, _, hasColon := strings.Cut(rr.name.Addr, ":")
+		handler, isCustom := schemes.GetOk(scheme)
+		if !hasColon || !isCustom {
+			if result != nil {
+				result = append(result, rr)
+			}
+			continue
+		}
+		// Avoid making a results slice in the common case where there
+		// are no custom scheme resolvers.
+		if result == nil {
+			result = make([]resolverAndDelay, i, len(rrs))
+			copy(result, rrs)
+		}
+		newAddr, err := handler(rr.name.Addr)
+		if err != nil {
+			logf("error from custom scheme handler, skipping resolver : %v", err)
+		}
+		if err != nil || newAddr == "" {
+			continue
+		}
+		newResolver := *rr.name
+		newResolver.Addr = newAddr
+		result = append(result, resolverAndDelay{name: &newResolver, startDelay: rr.startDelay})
+	}
+	// If we didn't have any custom schemes, return the original rrs.
+	if result == nil {
+		return rrs
+	}
+	return result
+}
+
 // resolvers returns the resolvers to use for domain.
 func (f *forwarder) resolvers(domain dnsname.FQDN) []resolverAndDelay {
 	f.mu.Lock()
 	routes := f.routes
 	cloudHostFallback := f.cloudHostFallback
+	schemes := f.schemeCacheLocked()
 	f.mu.Unlock()
+
 	for _, route := range routes {
-		if route.Suffix == "." || route.Suffix.Contains(domain) {
-			return route.Resolvers
+		if route.Suffix != "." && !route.Suffix.Contains(domain) {
+			continue
+		}
+		resolved := applySchemes(f.logf, route.Resolvers, schemes)
+		// If scheme resolution filtered out all resolvers from a non-empty
+		// route, fall through to the next matching route. If the resolvers
+		// were configured to be empty allow resolved to be empty.
+		if len(resolved) > 0 || len(route.Resolvers) == 0 {
+			return resolved
 		}
 	}
 	return cloudHostFallback // or nil if no fallback
@@ -980,6 +1208,39 @@ func (f *forwarder) GetUpstreamResolvers(name dnsname.FQDN) []*dnstype.Resolver 
 		upstreamResolvers = append(upstreamResolvers, r.name)
 	}
 	return upstreamResolvers
+}
+
+// RegisterCustomScheme adds a [CustomSchemeHandler] that is called to provide
+// an updated address when a [dnstype.Resolver.Addr] uses that scheme.
+func (f *forwarder) RegisterCustomScheme(scheme string, h CustomSchemeHandler) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.schemes[scheme]; ok {
+		return fmt.Errorf("scheme %q already registered", scheme)
+	}
+	f.invalidateSchemeCacheLocked()
+	mak.Set(&f.schemes, scheme, h)
+	return nil
+}
+
+// invalidateSchemeCacheLocked clears f.schemeCache so that it will be rebuilt
+// on the next call to f.schemeCacheLocked().
+func (f *forwarder) invalidateSchemeCacheLocked() {
+	f.schemeCache = views.Map[string, CustomSchemeHandler]{}
+}
+
+// schemeCacheLocked returns an immutable copy of f.schemes that can be used
+// after mu is unlocked.
+func (f *forwarder) schemeCacheLocked() views.Map[string, CustomSchemeHandler] {
+	if !f.schemeCache.IsNil() {
+		return f.schemeCache
+	}
+	if f.schemes == nil {
+		return f.schemeCache // returns a nil view
+	}
+	// Regenerate the cache
+	f.schemeCache = views.MapOf(maps.Clone(f.schemes))
+	return f.schemeCache
 }
 
 // forwardQuery is information and state about a forwarded DNS query that's
@@ -1055,8 +1316,11 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 	if len(resolvers) == 0 {
 		resolvers = f.resolvers(domain)
 		if len(resolvers) == 0 {
+			// No upstream resolver for this name isn't a forwarder failure:
+			// it's split DNS / a name we weren't asked to handle. Count it
+			// rather than raising dnsForwarderFailing, which is reserved for
+			// resolvers we found but couldn't reach. See tailscale/tailscale#19931.
 			metricDNSFwdErrorNoUpstream.Add(1)
-			f.health.SetUnhealthy(dnsForwarderFailing, health.Args{health.ArgDNSServers: ""})
 			f.logf("no upstream resolvers set, returning SERVFAIL")
 
 			res, err := servfailResponse(query)
@@ -1120,6 +1384,7 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 
 	var firstErr error
 	var numErr int
+	var sawNonRefused bool
 	for {
 		select {
 		case v := <-resc:
@@ -1139,30 +1404,56 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 			if firstErr == nil {
 				firstErr = err
 			}
+			if !errors.Is(err, errRefused) {
+				sawNonRefused = true
+			}
 			numErr++
 			if numErr == len(resolvers) {
-				if errors.Is(firstErr, errServerFailure) {
-					res, err := servfailResponse(query)
-					if err != nil {
-						f.logf("building servfail response: %v", err)
+				var res packet
+				if sawNonRefused {
+					// At least one server failed with SERVFAIL or a transport error
+					// (e.g. network failure, TxID mismatch, unsupported resolver type).
+					// All such errors map to SERVFAIL at the client level.
+					// Prefer returning the upstream SERVFAIL bytes from firstErr if
+					// available; otherwise synthesize a SERVFAIL response. Note the
+					// rcode guard: firstErr may be a REFUSED rcodeResponseError if it
+					// arrived before the SERVFAIL that set sawNonRefused.
+					if rcodeErr, ok := errors.AsType[rcodeResponseError](firstErr); ok && rcodeErr.rcode == dns.RCodeServerFailure {
+						res = packet{rcodeErr.res, query.family, query.addr}
+					} else {
+						r, err := servfailResponse(query)
+						if err != nil {
+							f.logf("building servfail response: %v", err)
+							return firstErr
+						}
+						res = r
+					}
+				} else {
+					// !sawNonRefused means every error was an rcodeResponseError with rcode REFUSED,
+					// so firstErr is guaranteed to wrap one.
+					rcodeErr, ok := errors.AsType[rcodeResponseError](firstErr)
+					if !ok {
+						f.logf("unexpected: all errors were REFUSED but firstErr is not rcodeResponseError: %v", firstErr)
 						return firstErr
 					}
-
-					select {
-					case <-ctx.Done():
-						metricDNSFwdErrorContext.Add(1)
-						metricDNSFwdErrorContextGotError.Add(1)
-						var resolverAddrs []string
-						for _, rr := range resolvers {
-							resolverAddrs = append(resolverAddrs, rr.name.Addr)
-						}
-						f.health.SetUnhealthy(dnsForwarderFailing, health.Args{health.ArgDNSServers: strings.Join(resolverAddrs, ",")})
-					case responseChan <- res:
-						if f.verboseFwd {
-							f.logf("forwarder response(%d, %v, %d) = %d, %v", fq.txid, typ, len(domain), len(res.bs), firstErr)
-						}
-						return nil
+					res = packet{rcodeErr.res, query.family, query.addr}
+				}
+				select {
+				case <-ctx.Done():
+					metricDNSFwdErrorContext.Add(1)
+					metricDNSFwdErrorContextGotError.Add(1)
+					var resolverAddrs []string
+					for _, rr := range resolvers {
+						resolverAddrs = append(resolverAddrs, rr.name.Addr)
 					}
+					if f.acceptDNS {
+						f.health.SetUnhealthy(dnsForwarderFailing, health.Args{health.ArgDNSServers: strings.Join(resolverAddrs, ",")})
+					}
+				case responseChan <- res:
+					if f.verboseFwd {
+						f.logf("forwarder response(%d, %v, %d) = %d, %v", fq.txid, typ, len(domain), len(res.bs), firstErr)
+					}
+					return nil
 				}
 				return firstErr
 			}
@@ -1175,13 +1466,14 @@ func (f *forwarder) forwardWithDestChan(ctx context.Context, query packet, respo
 
 			// If we haven't got an error or a successful response,
 			// include all resolvers in the error message so we can
-			// at least see what what servers we're trying to
-			// query.
+			// at least see what servers we're trying to query.
 			var resolverAddrs []string
 			for _, rr := range resolvers {
 				resolverAddrs = append(resolverAddrs, rr.name.Addr)
 			}
-			f.health.SetUnhealthy(dnsForwarderFailing, health.Args{health.ArgDNSServers: strings.Join(resolverAddrs, ",")})
+			if f.acceptDNS {
+				f.health.SetUnhealthy(dnsForwarderFailing, health.Args{health.ArgDNSServers: strings.Join(resolverAddrs, ",")})
+			}
 			return fmt.Errorf("waiting for response or error from %v: %w", resolverAddrs, ctx.Err())
 		}
 	}

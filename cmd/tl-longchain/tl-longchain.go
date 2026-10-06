@@ -45,7 +45,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	st, err := lc.NetworkLockStatus(ctx)
+	st, err := lc.TailnetLockStatus(ctx)
 	if err != nil {
 		log.Fatalf("could not get Tailnet Lock status: %v", err)
 	}
@@ -78,7 +78,7 @@ func print(info string, nodeKey key.NodePublic, sig tka.NodeKeySignature) {
 	if ln := chainLength(sig); ln > *maxRotations {
 		log.Printf("%s: chain length %d, printing command to re-sign", info, ln)
 		wrapping, _ := sig.UnverifiedWrappingPublic()
-		fmt.Printf("tailscale lock sign %s %s\n", nodeKey, key.NLPublicFromEd25519Unsafe(wrapping).CLIString())
+		fmt.Printf("tailscale lock sign %s %s\n", nodeKey, key.TLPublicFromEd25519Unsafe(wrapping).CLIString())
 	} else {
 		log.Printf("%s: does not need re-signing", info)
 	}

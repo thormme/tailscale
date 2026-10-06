@@ -7,6 +7,7 @@ package main
 
 import (
 	"fmt"
+	"maps"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -14,7 +15,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
-	"tailscale.com/types/ptr"
 	"tailscale.com/version"
 )
 
@@ -33,7 +33,7 @@ func tsrStatefulSet(tsr *tsapi.Recorder, namespace string, loginServer string) *
 			Annotations:     tsr.Spec.StatefulSet.Annotations,
 		},
 		Spec: appsv1.StatefulSetSpec{
-			Replicas: ptr.To(replicas),
+			Replicas: new(replicas),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: tsrLabels("recorder", tsr.Name, tsr.Spec.StatefulSet.Pod.Labels),
 			},
@@ -116,7 +116,7 @@ func tsrStatefulSet(tsr *tsapi.Recorder, namespace string, loginServer string) *
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
 					SecretName: fmt.Sprintf("%s-auth-%d", tsr.Name, replica),
-					Items:      []corev1.KeyToPath{{Key: "authkey", Path: "authkey"}},
+					Items:      []corev1.KeyToPath{{Key: authKeySecretKey, Path: authKeySecretKey}},
 				},
 			},
 		})
@@ -223,7 +223,7 @@ func tsrAuthSecret(tsr *tsapi.Recorder, namespace string, authKey string, replic
 			OwnerReferences: tsrOwnerReference(tsr),
 		},
 		StringData: map[string]string{
-			"authkey": authKey,
+			authKeySecretKey: authKey,
 		},
 	}
 }
@@ -313,9 +313,7 @@ func tsrEnv(tsr *tsapi.Recorder, loginServer string) []corev1.EnvVar {
 
 func tsrLabels(app, instance string, customLabels map[string]string) map[string]string {
 	labels := make(map[string]string, len(customLabels)+3)
-	for k, v := range customLabels {
-		labels[k] = v
-	}
+	maps.Copy(labels, customLabels)
 
 	// ref: https://kubernetes.io/docs/concepts/overview/working-with-objects/common-labels/
 	labels["app.kubernetes.io/name"] = app

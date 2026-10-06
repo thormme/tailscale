@@ -43,6 +43,7 @@ import (
 	"tailscale.com/net/netknob"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/netutil"
 	"tailscale.com/net/netx"
 	"tailscale.com/net/tlsdial"
 	"tailscale.com/paths"
@@ -53,12 +54,14 @@ import (
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/must"
 	"tailscale.com/util/racebuild"
-	"tailscale.com/util/syspolicy/pkey"
-	"tailscale.com/util/syspolicy/policyclient"
 	"tailscale.com/util/testenv"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 )
+
+// GetLogTarget is an optional hook to register a function
+// that returns the log target URL to be used by logpolicy.
+var GetLogTarget feature.Hook[func() string]
 
 var getLogTargetOnce struct {
 	sync.Once
@@ -67,8 +70,12 @@ var getLogTargetOnce struct {
 
 func getLogTarget() string {
 	getLogTargetOnce.Do(func() {
-		envTarget, _ := os.LookupEnv("TS_LOG_TARGET")
-		getLogTargetOnce.v, _ = policyclient.Get().GetString(pkey.LogTarget, envTarget)
+		if f, ok := GetLogTarget.GetOk(); ok {
+			getLogTargetOnce.v = f()
+		}
+		if getLogTargetOnce.v == "" {
+			getLogTargetOnce.v, _ = os.LookupEnv("TS_LOG_TARGET")
+		}
 	})
 
 	return getLogTargetOnce.v
@@ -539,7 +546,18 @@ func (opts Options) init(disableLogging bool) (*logtail.Config, *Policy) {
 		// anyway, no need to add one.
 		lflags = 0
 	}
-	console := log.New(stderrWriter{}, "", lflags)
+	var conWriter io.Writer = stderrWriter{}
+	if buildfeatures.HasSyslog {
+		if f, ok := feature.HookLogSink.GetOk(); ok {
+			if w := f(); w != nil {
+				// Logs are being redirected elsewhere (e.g. to syslog,
+				// which records its own timestamps).
+				conWriter = w
+				lflags = 0
+			}
+		}
+	}
+	console := log.New(conWriter, "", lflags)
 
 	var earlyErrBuf bytes.Buffer
 	earlyLogf := func(format string, a ...any) {
@@ -669,7 +687,10 @@ func (opts Options) init(disableLogging bool) (*logtail.Config, *Policy) {
 		logID := newc.PublicID.String()
 		exe, _ := os.Executable()
 		if strings.EqualFold(filepath.Base(exe), "tailscaled.exe") {
-			diskLogf := filelogger.New("tailscale-service", logID, lw.Logf)
+			// Alongside the log config: %ProgramData%\Tailscale\Logs for
+			// the service, or %LocalAppData%\Tailscale\Logs for a tailscaled
+			// run by a regular user. See LogsDir.
+			diskLogf := filelogger.New(filepath.Join(opts.Dir, "Logs"), "tailscale-service", logID, lw.Logf)
 			logOutput = logger.FuncWriter(diskLogf)
 		}
 	}
@@ -776,9 +797,18 @@ func (p *Policy) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+// logDNSCache is the DNS cache shared by all logtail dialers, so new
+// connections to the log server don't each cost a DNS lookup, even on
+// systems without a caching resolver.
+var logDNSCache = &dnscache.Resolver{
+	Forward:     dnscache.Get().Forward, // use default cache's forwarder
+	UseLastGood: true,
+}
+
 // MakeDialFunc creates a net.Dialer.DialContext function specialized for use
 // by logtail.
 // It does the following:
+//   - Resolves hostnames using a process-wide DNS cache.
 //   - If DNS lookup fails, consults the bootstrap DNS list of Tailscale hostnames.
 //   - If TLS connection fails, try again using LetsEncrypt's built-in root certificate,
 //     for the benefit of older OS platforms which might not include it.
@@ -789,18 +819,24 @@ func MakeDialFunc(netMon *netmon.Monitor, logf logger.Logf) netx.DialFunc {
 	if netMon == nil {
 		netMon = netmon.NewStatic()
 	}
-	return func(ctx context.Context, netw, addr string) (net.Conn, error) {
-		return dialContext(ctx, netw, addr, netMon, logf)
-	}
-}
-
-func dialContext(ctx context.Context, netw, addr string, netMon *netmon.Monitor, logf logger.Logf) (net.Conn, error) {
 	nd := netns.FromDialer(logf, netMon, &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: netknob.PlatformTCPKeepAlive(),
 	})
+	return makeDialFunc(nd.DialContext, netMon, logf)
+}
+
+// makeDialFunc is like [MakeDialFunc] but dials IP addresses using dial.
+func makeDialFunc(dial netx.DialFunc, netMon *netmon.Monitor, logf logger.Logf) netx.DialFunc {
+	cachedDial := dnscache.Dialer(dial, logDNSCache)
+	return func(ctx context.Context, netw, addr string) (net.Conn, error) {
+		return dialContext(ctx, netw, addr, dial, cachedDial, netMon, logf)
+	}
+}
+
+func dialContext(ctx context.Context, netw, addr string, dial, cachedDial netx.DialFunc, netMon *netmon.Monitor, logf logger.Logf) (net.Conn, error) {
 	t0 := time.Now()
-	c, err := nd.DialContext(ctx, netw, addr)
+	c, err := cachedDial(ctx, netw, addr)
 	d := time.Since(t0).Round(time.Millisecond)
 	if err == nil {
 		dialLog.Printf("dialed %q in %v", addr, d)
@@ -825,14 +861,24 @@ func dialContext(ctx context.Context, netw, addr string, netMon *netmon.Monitor,
 		}
 	}
 
-	// If we failed to dial, try again with bootstrap DNS.
+	// Either regular DNS (via logDNSCache) failed or the IPs it gave us
+	// didn't work, so try again with IPs from bootstrap DNS.
 	logf("logtail: dial %q failed: %v (in %v), trying bootstrap...", addr, err, d)
-	dnsCache := &dnscache.Resolver{
-		Forward:          dnscache.Get().Forward, // use default cache's forwarder
-		UseLastGood:      true,
-		LookupIPFallback: dnsfallback.MakeLookupFunc(logf, netMon),
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
 	}
-	dialer := dnscache.Dialer(nd.DialContext, dnsCache)
+	ips, err := dnsfallback.MakeLookupFunc(logf, netMon)(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no bootstrap DNS results for %q", host)
+	}
+	dialer := dnscache.Dialer(dial, &dnscache.Resolver{
+		SingleHost:             host,
+		SingleHostStaticResult: ips,
+	})
 	c, err = dialer(ctx, netw, addr)
 	if err == nil {
 		logf("logtail: bootstrap dial succeeded")
@@ -878,7 +924,7 @@ func (opts TransportOptions) New() http.RoundTripper {
 		opts.NetMon = netmon.NewStatic()
 	}
 	// Start with a copy of http.DefaultTransport and tweak it a bit.
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr := netutil.NewDefaultTransport()
 	if opts.TLSClientConfig != nil {
 		tr.TLSClientConfig = opts.TLSClientConfig.Clone()
 	}

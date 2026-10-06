@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/must"
 	"tailscale.com/util/set"
@@ -71,6 +72,13 @@ func nodeMac(n int) MAC {
 	return MAC{0x52, 0xcc, 0xcc, 0xcc, 0xcc, byte(n)}
 }
 
+// nodeNICMac returns the MAC for the nicIdx-th secondary NIC (1-indexed) of node n.
+// Primary NICs (index 0) use nodeMac. Secondary NICs use a different scheme:
+// 52:cc:cc:cc:KK:NN where KK is the NIC index and NN is the node number.
+func nodeNICMac(nodeNum, nicIdx int) MAC {
+	return MAC{0x52, 0xcc, 0xcc, 0xcc, byte(nicIdx), byte(nodeNum)}
+}
+
 func routerMac(n int) MAC {
 	// 52=TS then 0xee for 'etwork
 	return MAC{0x52, 0xee, 0xee, 0xee, 0xee, byte(n)}
@@ -89,11 +97,11 @@ func nodeLANIP6(n int) netip.Addr {
 // AddNode creates a new node in the world.
 //
 // The opts may be of the following types:
-//   - *Network: zero, one, or more networks to add this node to
+//   - [*Network]: zero, one, or more networks to add this node to
 //   - TODO: more
 //
 // On an error or unknown opt type, AddNode returns a
-// node with a carried error that gets returned later.
+// [Node] with a carried error that gets returned later.
 func (c *Config) AddNode(opts ...any) *Node {
 	num := len(c.nodes) + 1
 	n := &Node{
@@ -114,6 +122,8 @@ func (c *Config) AddNode(opts ...any) *Node {
 			switch o {
 			case HostFirewall:
 				n.hostFW = true
+			case DontJoinTailnet:
+				n.dontJoinTailnet = true
 			case VerboseSyslog:
 				n.verboseSyslog = true
 			default:
@@ -123,6 +133,8 @@ func (c *Config) AddNode(opts ...any) *Node {
 			}
 		case MAC:
 			n.mac = o
+		case tailcfg.NodeCapMap:
+			n.capMap = o
 		default:
 			if n.err == nil {
 				n.err = fmt.Errorf("unknown AddNode option type %T", o)
@@ -136,8 +148,9 @@ func (c *Config) AddNode(opts ...any) *Node {
 type NodeOption string
 
 const (
-	HostFirewall  NodeOption = "HostFirewall"
-	VerboseSyslog NodeOption = "VerboseSyslog"
+	HostFirewall    NodeOption = "HostFirewall"
+	DontJoinTailnet NodeOption = "DontJoinTailnet"
+	VerboseSyslog   NodeOption = "VerboseSyslog"
 )
 
 // TailscaledEnv is а option that can be passed to Config.AddNode
@@ -152,8 +165,8 @@ type TailscaledEnv struct {
 //   - string IP address, for the network's WAN IP (if any)
 //   - string netip.Prefix, for the network's LAN IP (defaults to 192.168.0.0/24)
 //     if IPv4, or its WAN IPv6 + CIDR (e.g. "2000:52::1/64")
-//   - NAT, the type of NAT to use
-//   - NetworkService, a service to add to the network
+//   - [NAT], the type of NAT to use
+//   - [NetworkService], a service to add to the network
 //
 // On an error or unknown opt type, AddNetwork returns a
 // network with a carried error that gets returned later.
@@ -197,13 +210,16 @@ func (c *Config) AddNetwork(opts ...any) *Network {
 
 // Node is the configuration of a node in the virtual network.
 type Node struct {
-	err error
-	num int   // 1-based node number
-	n   *node // nil until NewServer called
+	err    error
+	num    int   // 1-based node number
+	n      *node // nil until NewServer called
+	client *NodeAgentClient
 
-	env           []TailscaledEnv
-	hostFW        bool
-	verboseSyslog bool
+	env             []TailscaledEnv
+	hostFW          bool
+	verboseSyslog   bool
+	dontJoinTailnet bool
+	capMap          tailcfg.NodeCapMap
 
 	// TODO(bradfitz): this is halfway converted to supporting multiple NICs
 	// but not done. We need a MAC-per-Network.
@@ -222,9 +238,29 @@ func (n *Node) String() string {
 	return fmt.Sprintf("node%d", n.num)
 }
 
-// MAC returns the MAC address of the node.
+// MAC returns the MAC address of the node's primary NIC.
 func (n *Node) MAC() MAC {
 	return n.mac
+}
+
+// NumNICs returns the number of network interfaces on the node
+// (one per network the node is on).
+func (n *Node) NumNICs() int {
+	return len(n.nets)
+}
+
+// NICMac returns the MAC address for the i-th NIC (0-indexed).
+// NIC 0 is the primary NIC (same as MAC()). NIC 1+ are extra NICs.
+func (n *Node) NICMac(i int) MAC {
+	if i == 0 {
+		return n.mac
+	}
+	return nodeNICMac(n.num, i)
+}
+
+// Networks returns the list of networks this node is on.
+func (n *Node) Networks() []*Network {
+	return n.nets
 }
 
 func (n *Node) Env() []TailscaledEnv {
@@ -243,6 +279,23 @@ func (n *Node) SetVerboseSyslog(v bool) {
 	n.verboseSyslog = v
 }
 
+func (n *Node) SetClient(c *NodeAgentClient) {
+	n.client = c
+}
+
+// ShouldJoinTailnet reports whether node should join the test tailnet. Machines in
+// the virtual universe that aren't on the tailnet are useful for testing that
+// Tailscale does not break connectivity to resources outside the tailnet.
+func (n *Node) ShouldJoinTailnet() bool {
+	return !n.dontJoinTailnet
+}
+
+// WantCapMap returns the [tailcfg.NodeCapMap] that control should send down to
+// this node, if any.
+func (n *Node) WantCapMap() tailcfg.NodeCapMap {
+	return n.capMap
+}
+
 // IsV6Only reports whether this node is only connected to IPv6 networks.
 func (n *Node) IsV6Only() bool {
 	for _, net := range n.nets {
@@ -256,6 +309,26 @@ func (n *Node) IsV6Only() bool {
 		}
 	}
 	return false
+}
+
+// LanIP returns the node's LAN IPv4 address on the given network.
+// It requires the [Server] to have been initialized (i.e., [New] was called).
+// Returns an invalid addr if the node has no IP on that network.
+func (n *Node) LanIP(net *Network) netip.Addr {
+	if n.n == nil {
+		return netip.Addr{}
+	}
+	for i, nn := range n.nets {
+		if nn == net {
+			if i == 0 {
+				return n.n.lanIP
+			}
+			if i-1 < len(n.n.extraNICs) {
+				return n.n.extraNICs[i-1].lanIP
+			}
+		}
+	}
+	return netip.Addr{}
 }
 
 // Network returns the first network this node is connected to,
@@ -275,10 +348,11 @@ type Network struct {
 
 	wanIP6 netip.Prefix // global unicast router in host bits; CIDR is /64 delegated to LAN
 
-	wanIP4    netip.Addr // IPv4 WAN IP, if any
-	lanIP4    netip.Prefix
-	nodes     []*Node
-	breakWAN4 bool // whether to break WAN IPv4 connectivity
+	wanIP4                      netip.Addr // IPv4 WAN IP, if any
+	lanIP4                      netip.Prefix
+	nodes                       []*Node
+	breakWAN4                   bool // whether to break WAN IPv4 connectivity
+	network                     *network
 
 	svcs set.Set[NetworkService]
 
@@ -325,6 +399,12 @@ func (n *Network) CanTakeMoreNodes() bool {
 	return len(n.nodes) < 150
 }
 
+// BlackholeControlForAddr sets weither the network should drop all control
+// traffic for the specified addr starting immediately.
+func (n *Network) BlackholeControlForAddr(addr netip.Addr) {
+	n.network.BlackholeControlForAddr(addr)
+}
+
 // NetworkService is a service that can be added to a network.
 type NetworkService string
 
@@ -334,7 +414,7 @@ const (
 	UPnP   NetworkService = "UPnP"
 )
 
-// AddService adds a network service (such as port mapping protocols) to a
+// AddService adds a [NetworkService] (such as port mapping protocols) to a
 // network.
 func (n *Network) AddService(s NetworkService) {
 	if n.svcs == nil {
@@ -390,6 +470,8 @@ func (s *Server) initFromConfig(c *Config) error {
 		}
 		netOfConf[conf] = n
 		s.networks.Add(n)
+
+		conf.network = n
 		if conf.wanIP4.IsValid() {
 			if conf.wanIP4.Is6() {
 				return fmt.Errorf("invalid IPv6 address in wanIP")
@@ -421,10 +503,11 @@ func (s *Server) initFromConfig(c *Config) error {
 		if conf.err != nil {
 			return conf.err
 		}
+		primaryNet := netOfConf[conf.Network()]
 		n := &node{
 			num:           conf.num,
 			mac:           conf.mac,
-			net:           netOfConf[conf.Network()],
+			net:           primaryNet,
 			verboseSyslog: conf.VerboseSyslog(),
 		}
 		n.interfaceID = must.Get(s.pcapWriter.AddInterface(pcapgo.NgInterface{
@@ -438,16 +521,50 @@ func (s *Server) initFromConfig(c *Config) error {
 		s.nodes = append(s.nodes, n)
 		s.nodeByMAC[n.mac] = n
 
-		if n.net.v4 {
+		if n.net != nil && n.net.v4 {
 			// Allocate a lanIP for the node. Use the network's CIDR and use final
 			// octet 101 (for first node), 102, etc. The node number comes from the
-			// last octent of the MAC address (0-based)
+			// last octet of the MAC address (0-based)
 			ip4 := n.net.lanIP4.Addr().As4()
 			ip4[3] = 100 + n.mac[5]
 			n.lanIP = netip.AddrFrom4(ip4)
 			n.net.nodesByIP4[n.lanIP] = n
 		}
-		n.net.nodesByMAC[n.mac] = n
+		if n.net != nil {
+			n.net.nodesByMAC[n.mac] = n
+		}
+
+		// Set up extra NICs for multi-homed nodes (nodes on more than one network).
+		for nicIdx, confNet := range conf.nets[1:] {
+			extraNet := netOfConf[confNet]
+			if extraNet == nil {
+				continue
+			}
+			mac := nodeNICMac(conf.num, nicIdx+1)
+			nic := nodeNIC{
+				mac: mac,
+				net: extraNet,
+			}
+			nic.interfaceID = must.Get(s.pcapWriter.AddInterface(pcapgo.NgInterface{
+				Name:     fmt.Sprintf("%s-nic%d", n.String(), nicIdx+1),
+				LinkType: layers.LinkTypeEthernet,
+			}))
+			// Allocate a lanIP for the node. Use the network's CIDR and use final
+			// octet 101 (for first node), 102, etc. The node number comes from the
+			// last octet of the MAC address (0-based)
+			if extraNet.v4 {
+				ip4 := extraNet.lanIP4.Addr().As4()
+				ip4[3] = 100 + mac[5]
+				nic.lanIP = netip.AddrFrom4(ip4)
+				extraNet.nodesByIP4[nic.lanIP] = n
+			}
+			extraNet.nodesByMAC[mac] = n
+			if _, ok := s.nodeByMAC[mac]; ok {
+				return fmt.Errorf("two nodes have the same MAC %v", mac)
+			}
+			s.nodeByMAC[mac] = n
+			n.extraNICs = append(n.extraNICs, nic)
+		}
 	}
 
 	// Now that nodes are populated, set up NAT:

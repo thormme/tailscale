@@ -11,7 +11,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
+	"maps"
+	"net/netip"
 	"os"
 	"path"
 	"slices"
@@ -29,16 +30,18 @@ import (
 	"k8s.io/apiserver/pkg/storage/names"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
+	"tailscale.com/client/tailscale/v2"
 
-	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
 	tsoperator "tailscale.com/k8s-operator"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/k8s-operator/reconciler"
+	"tailscale.com/k8s-operator/reconciler/staticendpoints"
+	"tailscale.com/k8s-operator/tsclient"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/net/netutil"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/opt"
-	"tailscale.com/types/ptr"
 	"tailscale.com/util/mak"
 )
 
@@ -68,6 +71,12 @@ const (
 
 	AnnotationProxyGroup = "tailscale.com/proxy-group"
 
+	// AnnotationShareACMEAccount opts a single ProxyGroup into ("true")
+	// or out of ("false") using the shared per-tailnet ACME account key.
+	// When absent, OPERATOR_SHARED_ACME_ACCOUNT_KEY on the operator is
+	// the default. See tailscale/tailscale#18251.
+	AnnotationShareACMEAccount = "tailscale.com/share-acme-account"
+
 	// Annotations settable by users on ingresses.
 	AnnotationFunnel       = "tailscale.com/funnel"
 	AnnotationHTTPRedirect = "tailscale.com/http-redirect"
@@ -82,6 +91,12 @@ const (
 	// tailscale in non-userspace, with NET_ADMIN cap for tailscale
 	// container and will also run a privileged init container that enables
 	// forwarding.
+	// Because the forwarded traffic reaches serve on the proxy's Pod IP
+	// rather than over the tunnel interface, the annotation also sets
+	// TS_SERVE_ALLOW_ALL_INTERFACES so the serve listener is not bound to the
+	// tunnel interface (which would otherwise drop it). This exposes the serve
+	// listener on the proxy's other interfaces, so only enable this on proxies
+	// whose Pod network is trusted.
 	// Eventually this behaviour might become the default.
 	AnnotationExperimentalForwardClusterTrafficViaL7IngresProxy = "tailscale.com/experimental-forward-cluster-traffic-via-ingress"
 
@@ -156,6 +171,19 @@ type tailscaleSTSConfig struct {
 
 	// Tailnet specifies the Tailnet resource to use for producing auth keys.
 	Tailnet string
+
+	// Fields set by Provision when the proxy's ProxyClass configures static
+	// endpoints (only supported for Connector proxies).
+
+	// svcToNodePorts maps the name of each replica's static endpoints
+	// NodePort Service to its allocated NodePort.
+	svcToNodePorts map[string]uint16
+	// tailscaledPort is the port tailscaled should listen on, the target
+	// port shared by all the static endpoints NodePort Services.
+	tailscaledPort *uint16
+	// staticEndpointsPerReplica maps replica ordinals to the static
+	// endpoints advertised in their tailscaled config.
+	staticEndpointsPerReplica map[int32][]netip.AddrPort
 }
 
 type connector struct {
@@ -174,7 +202,7 @@ type tsnetServer interface {
 type tailscaleSTSReconciler struct {
 	client.Client
 	tsnetServer            tsnetServer
-	tsClient               tsClient
+	clients                ClientProvider
 	defaultTags            []string
 	operatorNamespace      string
 	proxyImage             string
@@ -183,9 +211,9 @@ type tailscaleSTSReconciler struct {
 	loginServer            string
 }
 
-func (sts tailscaleSTSReconciler) validate() error {
-	if sts.tsFirewallMode != "" && !isValidFirewallMode(sts.tsFirewallMode) {
-		return fmt.Errorf("invalid proxy firewall mode %s, valid modes are iptables, nftables or unset", sts.tsFirewallMode)
+func (r *tailscaleSTSReconciler) validate() error {
+	if r.tsFirewallMode != "" && !isValidFirewallMode(r.tsFirewallMode) {
+		return fmt.Errorf("invalid proxy firewall mode %s, valid modes are iptables, nftables or unset", r.tsFirewallMode)
 	}
 	return nil
 }
@@ -197,27 +225,17 @@ func IsHTTPSEnabledOnTailnet(tsnetServer tsnetServer) bool {
 
 // Provision ensures that the StatefulSet for the given service is running and
 // up to date.
-func (a *tailscaleSTSReconciler) Provision(ctx context.Context, logger *zap.SugaredLogger, sts *tailscaleSTSConfig) (*corev1.Service, error) {
-	tailscaleClient := a.tsClient
-	if sts.Tailnet != "" {
-		tc, err := clientForTailnet(ctx, a.Client, a.operatorNamespace, sts.Tailnet)
-		if err != nil {
-			return nil, err
-		}
-
-		tailscaleClient = tc
-	}
-
+func (r *tailscaleSTSReconciler) Provision(ctx context.Context, logger *zap.SugaredLogger, sts *tailscaleSTSConfig) (*corev1.Service, error) {
 	// Do full reconcile.
 	// TODO (don't create Service for the Connector)
-	hsvc, err := a.reconcileHeadlessService(ctx, logger, sts)
+	hsvc, err := r.reconcileHeadlessService(ctx, logger, sts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to reconcile headless service: %w", err)
 	}
 
 	proxyClass := new(tsapi.ProxyClass)
 	if sts.ProxyClassName != "" {
-		if err := a.Get(ctx, types.NamespacedName{Name: sts.ProxyClassName}, proxyClass); err != nil {
+		if err := r.Get(ctx, types.NamespacedName{Name: sts.ProxyClassName}, proxyClass); err != nil {
 			return nil, fmt.Errorf("failed to get ProxyClass: %w", err)
 		}
 		if !tsoperator.ProxyClassIsReady(proxyClass) {
@@ -227,12 +245,23 @@ func (a *tailscaleSTSReconciler) Provision(ctx context.Context, logger *zap.Suga
 	}
 	sts.ProxyClass = proxyClass
 
-	secretNames, err := a.provisionSecrets(ctx, tailscaleClient, logger, sts, hsvc)
+	if sts.proxyType == proxyTypeConnector {
+		if err := r.reconcileStaticEndpoints(ctx, sts, hsvc); err != nil {
+			return nil, fmt.Errorf("failed to reconcile static endpoints: %w", err)
+		}
+	}
+
+	tsClient, err := r.clients.For(sts.Tailnet)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tailscale client: %w", err)
+	}
+
+	secretNames, err := r.provisionSecrets(ctx, tsClient, sts, hsvc, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create or get API key secret: %w", err)
 	}
 
-	_, err = a.reconcileSTS(ctx, logger, sts, hsvc, secretNames)
+	_, err = r.reconcileSTS(ctx, logger, sts, hsvc, secretNames)
 	if err != nil {
 		return nil, fmt.Errorf("failed to reconcile statefulset: %w", err)
 	}
@@ -242,25 +271,113 @@ func (a *tailscaleSTSReconciler) Provision(ctx context.Context, logger *zap.Suga
 		proxyLabels:  hsvc.Labels,
 		proxyType:    sts.proxyType,
 	}
-	if err = reconcileMetricsResources(ctx, logger, mo, sts.ProxyClass, a.Client); err != nil {
+	if err = reconcileMetricsResources(ctx, logger, mo, sts.ProxyClass, r.Client); err != nil {
 		return nil, fmt.Errorf("failed to ensure metrics resources: %w", err)
 	}
 	return hsvc, nil
 }
 
+// reconcileStaticEndpoints provisions a static endpoints NodePort Service for
+// each replica of the proxy when its ProxyClass configures static endpoints,
+// and deletes the NodePort Services when it does not (or when the replica
+// count shrinks). The allocated ports are stored on the config for
+// provisionSecrets and reconcileSTS to consume.
+func (r *tailscaleSTSReconciler) reconcileStaticEndpoints(ctx context.Context, sts *tailscaleSTSConfig, hsvc *corev1.Service) error {
+	if sts.ProxyClass == nil || sts.ProxyClass.Spec.StaticEndpoints == nil {
+		// The ProxyClass may have been switched away from one that
+		// configured static endpoints, so delete any dangling NodePort
+		// Services.
+		return deleteStaticEndpointsServices(ctx, r.Client, r.operatorNamespace, sts.proxyType, sts.ParentResourceName, 0)
+	}
+
+	var err error
+	sts.svcToNodePorts, sts.tailscaledPort, err = staticendpoints.EnsureNodePortServices(ctx, r.Client, staticendpoints.Config{
+		Namespace:      r.operatorNamespace,
+		ParentType:     sts.proxyType,
+		ParentName:     sts.ParentResourceName,
+		ProxyClassName: sts.ProxyClass.Name,
+		Replicas:       sts.Replicas,
+		PortRanges:     sts.ProxyClass.Spec.StaticEndpoints.NodePort.Ports,
+		MakeService: func(ordinal int32, name string) *corev1.Service {
+			return nodePortService(sts, hsvc, ordinal, name, r.operatorNamespace)
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("error provisioning NodePort Services for static endpoints: %w", err)
+	}
+
+	// Delete NodePort Services of replicas that no longer exist after a
+	// scale down.
+	return deleteStaticEndpointsServices(ctx, r.Client, r.operatorNamespace, sts.proxyType, sts.ParentResourceName, sts.Replicas)
+}
+
+// nodePortService returns the base definition of the static endpoints
+// NodePort Service for the given replica of the proxy's StatefulSet. Unlike
+// most child resources its labels do not carry parent-resource-ns: the
+// headless Service is looked up by the full child resource label set, so the
+// NodePort Services must not match it.
+func nodePortService(sts *tailscaleSTSConfig, hsvc *corev1.Service, ordinal int32, name, namespace string) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    reconciler.Labels(sts.proxyType, sts.ParentResourceName, ""),
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeNodePort,
+			Ports: []corev1.ServicePort{
+				{
+					Name:     staticEndpointPortName,
+					Protocol: corev1.ProtocolUDP,
+				},
+			},
+			// The StatefulSet is named after the headless Service, so
+			// each replica's Pod is named <headless Service name>-<ordinal>.
+			Selector: map[string]string{
+				appsv1.StatefulSetPodNameLabel: fmt.Sprintf("%s-%d", hsvc.Name, ordinal),
+			},
+		},
+	}
+}
+
+// deleteStaticEndpointsServices deletes the static endpoints NodePort
+// Services of the parent resource's replicas with ordinals >= keepReplicas.
+// Passing 0 deletes all of them.
+func deleteStaticEndpointsServices(ctx context.Context, c client.Client, namespace, proxyType, parentName string, keepReplicas int32) error {
+	svcs := new(corev1.ServiceList)
+	if err := c.List(ctx, svcs, client.InNamespace(namespace), client.MatchingLabels(reconciler.Labels(proxyType, parentName, ""))); err != nil {
+		return fmt.Errorf("error listing static endpoints Services: %w", err)
+	}
+
+	for _, svc := range svcs.Items {
+		// The headless Service shares the same labels, so only consider
+		// NodePort Services.
+		if svc.Spec.Type != corev1.ServiceTypeNodePort {
+			continue
+		}
+		var ordinal int32
+		if _, err := fmt.Sscanf(svc.Name, parentName+"-%d-nodeport", &ordinal); err != nil {
+			continue
+		}
+		if ordinal < keepReplicas {
+			continue
+		}
+		if err := c.Delete(ctx, &svc); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("error deleting static endpoints Service %q: %w", svc.Name, err)
+		}
+	}
+
+	return nil
+}
+
 // Cleanup removes all resources associated that were created by Provision with
 // the given labels. It returns true when all resources have been removed,
 // otherwise it returns false and the caller should retry later.
-func (a *tailscaleSTSReconciler) Cleanup(ctx context.Context, tailnet string, logger *zap.SugaredLogger, labels map[string]string, typ string) (done bool, _ error) {
-	tailscaleClient := a.tsClient
-	if tailnet != "" {
-		tc, err := clientForTailnet(ctx, a.Client, a.operatorNamespace, tailnet)
-		if err != nil {
-			logger.Errorf("failed to get tailscale client: %v", err)
-			return false, nil
-		}
-
-		tailscaleClient = tc
+func (r *tailscaleSTSReconciler) Cleanup(ctx context.Context, tailnet string, logger *zap.SugaredLogger, labels map[string]string, typ string) (done bool, _ error) {
+	tsClient, err := r.clients.For(tailnet)
+	if err != nil {
+		logger.Errorf("failed to get tailscale client: %v", err)
+		return false, nil
 	}
 
 	// Need to delete the StatefulSet first, and delete it with foreground
@@ -269,7 +386,7 @@ func (a *tailscaleSTSReconciler) Cleanup(ctx context.Context, tailnet string, lo
 	// assuming k8s ordering semantics don't mess with us, that should avoid
 	// tailscale device deletion races where we fail to notice a device that
 	// should be removed.
-	sts, err := getSingleObject[appsv1.StatefulSet](ctx, a.Client, a.operatorNamespace, labels)
+	sts, err := getSingleObject[appsv1.StatefulSet](ctx, r.Client, r.operatorNamespace, labels)
 	if err != nil {
 		return false, fmt.Errorf("getting statefulset: %w", err)
 	}
@@ -283,12 +400,12 @@ func (a *tailscaleSTSReconciler) Cleanup(ctx context.Context, tailnet string, lo
 		}
 
 		options := []client.DeleteAllOfOption{
-			client.InNamespace(a.operatorNamespace),
+			client.InNamespace(r.operatorNamespace),
 			client.MatchingLabels(labels),
 			client.PropagationPolicy(metav1.DeletePropagationForeground),
 		}
 
-		if err = a.DeleteAllOf(ctx, &appsv1.StatefulSet{}, options...); err != nil {
+		if err = r.DeleteAllOf(ctx, &appsv1.StatefulSet{}, options...); err != nil {
 			return false, fmt.Errorf("deleting statefulset: %w", err)
 		}
 
@@ -296,7 +413,7 @@ func (a *tailscaleSTSReconciler) Cleanup(ctx context.Context, tailnet string, lo
 		return false, nil
 	}
 
-	devices, err := a.DeviceInfo(ctx, labels, logger)
+	devices, err := r.DeviceInfo(ctx, labels, logger)
 	if err != nil {
 		return false, fmt.Errorf("getting device info: %w", err)
 	}
@@ -304,34 +421,44 @@ func (a *tailscaleSTSReconciler) Cleanup(ctx context.Context, tailnet string, lo
 	for _, dev := range devices {
 		if dev.id != "" {
 			logger.Debugf("deleting device %s from control", string(dev.id))
-			if err = tailscaleClient.DeleteDevice(ctx, string(dev.id)); err != nil {
-				errResp := &tailscale.ErrResponse{}
-				if ok := errors.As(err, errResp); ok && errResp.Status == http.StatusNotFound {
-					logger.Debugf("device %s not found, likely because it has already been deleted from control", string(dev.id))
-				} else {
-					return false, fmt.Errorf("deleting device: %w", err)
-				}
-			} else {
-				logger.Debugf("device %s deleted from control", string(dev.id))
+			err = tsClient.Devices().Delete(ctx, string(dev.id))
+			switch {
+			case tailscale.IsNotFound(err):
+				logger.Debugf("device %s not found, likely because it has already been deleted from control", string(dev.id))
+			case err != nil:
+				return false, fmt.Errorf("deleting device: %w", err)
 			}
+
+			logger.Debugf("device %s deleted from control", string(dev.id))
 		}
 	}
 
-	types := []client.Object{
+	resourceTypes := []client.Object{
 		&corev1.Service{},
 		&corev1.Secret{},
 	}
-	for _, typ := range types {
-		if err := a.DeleteAllOf(ctx, typ, client.InNamespace(a.operatorNamespace), client.MatchingLabels(labels)); err != nil {
+
+	for _, resourceType := range resourceTypes {
+		if err = r.DeleteAllOf(ctx, resourceType, client.InNamespace(r.operatorNamespace), client.MatchingLabels(labels)); err != nil {
 			return false, err
 		}
 	}
+
+	if typ == proxyTypeConnector {
+		// Static endpoints NodePort Services carry a reduced label set, so
+		// they are not caught by the deletes above.
+		if err := deleteStaticEndpointsServices(ctx, r.Client, r.operatorNamespace, typ, labels[LabelParentName], 0); err != nil {
+			return false, fmt.Errorf("error deleting static endpoints Services: %w", err)
+		}
+	}
+
 	mo := &metricsOpts{
 		proxyLabels: labels,
-		tsNamespace: a.operatorNamespace,
+		tsNamespace: r.operatorNamespace,
 		proxyType:   typ,
 	}
-	if err = maybeCleanupMetricsResources(ctx, mo, a.Client); err != nil {
+
+	if err = maybeCleanupMetricsResources(ctx, mo, r.Client); err != nil {
 		return false, fmt.Errorf("error cleaning up metrics resources: %w", err)
 	}
 
@@ -365,12 +492,12 @@ func statefulSetNameBase(parent string) string {
 	}
 }
 
-func (a *tailscaleSTSReconciler) reconcileHeadlessService(ctx context.Context, logger *zap.SugaredLogger, sts *tailscaleSTSConfig) (*corev1.Service, error) {
+func (r *tailscaleSTSReconciler) reconcileHeadlessService(ctx context.Context, logger *zap.SugaredLogger, sts *tailscaleSTSConfig) (*corev1.Service, error) {
 	nameBase := statefulSetNameBase(sts.ParentResourceName)
 	hsvc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: nameBase,
-			Namespace:    a.operatorNamespace,
+			Namespace:    r.operatorNamespace,
 			Labels:       sts.ChildResourceLabels,
 		},
 		Spec: corev1.ServiceSpec{
@@ -378,14 +505,14 @@ func (a *tailscaleSTSReconciler) reconcileHeadlessService(ctx context.Context, l
 			Selector: map[string]string{
 				"app": sts.ParentResourceUID,
 			},
-			IPFamilyPolicy: ptr.To(corev1.IPFamilyPolicyPreferDualStack),
+			IPFamilyPolicy: new(corev1.IPFamilyPolicyPreferDualStack),
 		},
 	}
 	logger.Debugf("reconciling headless service for StatefulSet")
-	return createOrUpdate(ctx, a.Client, a.operatorNamespace, hsvc, func(svc *corev1.Service) { svc.Spec = hsvc.Spec })
+	return createOrUpdate(ctx, r.Client, r.operatorNamespace, hsvc, func(svc *corev1.Service) { svc.Spec = hsvc.Spec })
 }
 
-func (a *tailscaleSTSReconciler) provisionSecrets(ctx context.Context, tailscaleClient tsClient, logger *zap.SugaredLogger, stsC *tailscaleSTSConfig, hsvc *corev1.Service) ([]string, error) {
+func (r *tailscaleSTSReconciler) provisionSecrets(ctx context.Context, tsClient tsclient.Client, stsC *tailscaleSTSConfig, hsvc *corev1.Service, logger *zap.SugaredLogger) ([]string, error) {
 	secretNames := make([]string, stsC.Replicas)
 
 	// Start by ensuring we have Secrets for the desired number of replicas. This will handle both creating and scaling
@@ -394,7 +521,7 @@ func (a *tailscaleSTSReconciler) provisionSecrets(ctx context.Context, tailscale
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      fmt.Sprintf("%s-%d", hsvc.Name, i),
-				Namespace: a.operatorNamespace,
+				Namespace: r.operatorNamespace,
 				Labels:    stsC.ChildResourceLabels,
 			},
 		}
@@ -409,7 +536,7 @@ func (a *tailscaleSTSReconciler) provisionSecrets(ctx context.Context, tailscale
 		secretNames[i] = secret.Name
 
 		var orig *corev1.Secret // unmodified copy of secret
-		if err := a.Get(ctx, client.ObjectKeyFromObject(secret), secret); err == nil {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(secret), secret); err == nil {
 			logger.Debugf("secret %s/%s already exists", secret.GetNamespace(), secret.GetName())
 			orig = secret.DeepCopy()
 		} else if !apierrors.IsNotFound(err) {
@@ -420,21 +547,38 @@ func (a *tailscaleSTSReconciler) provisionSecrets(ctx context.Context, tailscale
 			authKey string
 			err     error
 		)
+
 		if orig == nil {
 			// Create API Key secret which is going to be used by the statefulset
 			// to authenticate with Tailscale.
 			logger.Debugf("creating authkey for new tailscale proxy")
 			tags := stsC.Tags
 			if len(tags) == 0 {
-				tags = a.defaultTags
+				tags = r.defaultTags
 			}
-			authKey, err = newAuthKey(ctx, tailscaleClient, tags)
+
+			authKey, err = newAuthKey(ctx, tsClient, tags)
 			if err != nil {
 				return nil, err
 			}
 		}
 
-		configs, err := tailscaledConfig(stsC, authKey, orig, hostname)
+		var staticEndpoints []netip.AddrPort
+		if len(stsC.svcToNodePorts) > 0 {
+			nodePortSvcName := staticendpoints.NodePortServiceName(stsC.ParentResourceName, i)
+			port, ok := stsC.svcToNodePorts[nodePortSvcName]
+			if !ok {
+				return nil, fmt.Errorf("could not find configured NodePort for replica %d", i)
+			}
+
+			staticEndpoints, err = staticendpoints.FindEndpoints(ctx, r.Client, staticEndpointsFromConfigSecret(orig, logger), stsC.ProxyClass, port, logger)
+			if err != nil {
+				return nil, fmt.Errorf("could not find static endpoints for replica %d: %w", i, err)
+			}
+			mak.Set(&stsC.staticEndpointsPerReplica, i, staticEndpoints)
+		}
+
+		configs, err := tailscaledConfig(stsC, tsClient.LoginURL(), authKey, orig, hostname, staticEndpoints)
 		if err != nil {
 			return nil, fmt.Errorf("error creating tailscaled config: %w", err)
 		}
@@ -466,12 +610,12 @@ func (a *tailscaleSTSReconciler) provisionSecrets(ctx context.Context, tailscale
 
 		if orig != nil && !apiequality.Semantic.DeepEqual(latest, orig) {
 			logger.With("config", sanitizeConfig(latestConfig)).Debugf("patching the existing proxy Secret")
-			if err = a.Patch(ctx, secret, client.MergeFrom(orig)); err != nil {
+			if err = r.Patch(ctx, secret, client.MergeFrom(orig)); err != nil {
 				return nil, err
 			}
 		} else {
 			logger.With("config", sanitizeConfig(latestConfig)).Debugf("creating a new Secret for the proxy")
-			if err = a.Create(ctx, secret); err != nil {
+			if err = r.Create(ctx, secret); err != nil {
 				return nil, err
 			}
 		}
@@ -480,7 +624,7 @@ func (a *tailscaleSTSReconciler) provisionSecrets(ctx context.Context, tailscale
 	// Next, we check if we have additional secrets and remove them and their associated device. This happens when we
 	// scale an StatefulSet down.
 	var secrets corev1.SecretList
-	if err := a.List(ctx, &secrets, client.InNamespace(a.operatorNamespace), client.MatchingLabels(stsC.ChildResourceLabels)); err != nil {
+	if err := r.List(ctx, &secrets, client.InNamespace(r.operatorNamespace), client.MatchingLabels(stsC.ChildResourceLabels)); err != nil {
 		return nil, err
 	}
 
@@ -500,19 +644,14 @@ func (a *tailscaleSTSReconciler) provisionSecrets(ctx context.Context, tailscale
 		}
 
 		if dev != nil && dev.id != "" {
-			var errResp *tailscale.ErrResponse
-
-			err = tailscaleClient.DeleteDevice(ctx, string(dev.id))
-			switch {
-			case errors.As(err, &errResp) && errResp.Status == http.StatusNotFound:
-				// This device has possibly already been deleted in the admin console. So we can ignore this
-				// and move on to removing the secret.
-			case err != nil:
+			// If we get a not found error then this device has possibly already been deleted in the admin console.
+			// So we can ignore this and move on to removing the secret.
+			if err = tsClient.Devices().Delete(ctx, string(dev.id)); err != nil && !tailscale.IsNotFound(err) {
 				return nil, err
 			}
 		}
 
-		if err = a.Delete(ctx, &secret); err != nil {
+		if err = r.Delete(ctx, &secret); err != nil {
 			return nil, err
 		}
 	}
@@ -526,7 +665,7 @@ func sanitizeConfig(c ipn.ConfigVAlpha) ipn.ConfigVAlpha {
 	// Explicitly redact AuthKey because we never want it appearing in logs. Never populate this with the
 	// actual auth key.
 	if c.AuthKey != nil {
-		c.AuthKey = ptr.To("**redacted**")
+		c.AuthKey = new("**redacted**")
 	}
 
 	return c
@@ -536,9 +675,9 @@ func sanitizeConfig(c ipn.ConfigVAlpha) ipn.ConfigVAlpha {
 // It retrieves info from a Kubernetes Secret labeled with the provided labels. Capver is cross-validated against the
 // Pod to ensure that it is the currently running Pod that set the capver. If the Pod or the Secret does not exist, the
 // returned capver is -1. Either of device ID, hostname and IPs can be empty string if not found in the Secret.
-func (a *tailscaleSTSReconciler) DeviceInfo(ctx context.Context, childLabels map[string]string, logger *zap.SugaredLogger) ([]*device, error) {
+func (r *tailscaleSTSReconciler) DeviceInfo(ctx context.Context, childLabels map[string]string, logger *zap.SugaredLogger) ([]*device, error) {
 	var secrets corev1.SecretList
-	if err := a.List(ctx, &secrets, client.InNamespace(a.operatorNamespace), client.MatchingLabels(childLabels)); err != nil {
+	if err := r.List(ctx, &secrets, client.InNamespace(r.operatorNamespace), client.MatchingLabels(childLabels)); err != nil {
 		return nil, err
 	}
 
@@ -546,7 +685,7 @@ func (a *tailscaleSTSReconciler) DeviceInfo(ctx context.Context, childLabels map
 	for _, sec := range secrets.Items {
 		podUID := ""
 		pod := new(corev1.Pod)
-		err := a.Get(ctx, types.NamespacedName{Namespace: sec.Namespace, Name: sec.Name}, pod)
+		err := r.Get(ctx, types.NamespacedName{Namespace: sec.Namespace, Name: sec.Name}, pod)
 		switch {
 		case apierrors.IsNotFound(err):
 			// If the Pod is not found, we won't have its UID. We can still get the device information but the
@@ -579,6 +718,9 @@ type device struct {
 	// when the device has been configured to serve traffic on it via 'tailscale serve'.
 	ingressDNSName string
 	capver         tailcfg.CapabilityVersion
+	// ordinal is the replica ordinal parsed from the state Secret's name,
+	// or -1 if it could not be parsed.
+	ordinal int32
 }
 
 func deviceInfo(sec *corev1.Secret, podUID string, log *zap.SugaredLogger) (dev *device, err error) {
@@ -586,7 +728,7 @@ func deviceInfo(sec *corev1.Secret, podUID string, log *zap.SugaredLogger) (dev 
 	if id == "" {
 		return dev, nil
 	}
-	dev = &device{id: id}
+	dev = &device{id: id, ordinal: ordinalFromName(sec.Name)}
 	// Kubernetes chokes on well-formed FQDNs with the trailing dot, so we have
 	// to remove it.
 	dev.hostname = strings.TrimSuffix(string(sec.Data[kubetypes.KeyDeviceFQDN]), ".")
@@ -619,22 +761,34 @@ func deviceInfo(sec *corev1.Secret, podUID string, log *zap.SugaredLogger) (dev 
 	return dev, nil
 }
 
-func newAuthKey(ctx context.Context, tsClient tsClient, tags []string) (string, error) {
-	caps := tailscale.KeyCapabilities{
-		Devices: tailscale.KeyDeviceCapabilities{
-			Create: tailscale.KeyDeviceCreateCapabilities{
-				Reusable:      false,
-				Preauthorized: true,
-				Tags:          tags,
-			},
-		},
+// ordinalFromName returns the replica ordinal from the name of a resource
+// created per replica of a StatefulSet, such as a Pod or state Secret named
+// <StatefulSet name>-<ordinal>. It returns -1 if the name does not end in an
+// ordinal.
+func ordinalFromName(name string) int32 {
+	idx := strings.LastIndex(name, "-")
+	if idx < 0 {
+		return -1
 	}
+	ordinal, err := strconv.ParseInt(name[idx+1:], 10, 32)
+	if err != nil {
+		return -1
+	}
+	return int32(ordinal)
+}
 
-	key, _, err := tsClient.CreateKey(ctx, caps)
+func newAuthKey(ctx context.Context, client tsclient.Client, tags []string) (string, error) {
+	var caps tailscale.KeyCapabilities
+	caps.Devices.Create.Reusable = false
+	caps.Devices.Create.Preauthorized = true
+	caps.Devices.Create.Tags = tags
+
+	key, err := client.Keys().CreateAuthKey(ctx, tailscale.CreateKeyRequest{Capabilities: caps})
 	if err != nil {
 		return "", err
 	}
-	return key, nil
+
+	return key.Key, nil
 }
 
 //go:embed deploy/manifests/proxy.yaml
@@ -643,7 +797,7 @@ var proxyYaml []byte
 //go:embed deploy/manifests/userspace-proxy.yaml
 var userspaceProxyYaml []byte
 
-func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.SugaredLogger, sts *tailscaleSTSConfig, headlessSvc *corev1.Service, proxySecrets []string) (*appsv1.StatefulSet, error) {
+func (r *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.SugaredLogger, sts *tailscaleSTSConfig, headlessSvc *corev1.Service, proxySecrets []string) (*appsv1.StatefulSet, error) {
 	ss := new(appsv1.StatefulSet)
 	if sts.ServeConfig != nil && sts.ForwardClusterTrafficViaL7IngressProxy != true { // If forwarding cluster traffic via is required we need non-userspace + NET_ADMIN + forwarding
 		if err := yaml.Unmarshal(userspaceProxyYaml, &ss); err != nil {
@@ -656,17 +810,17 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 		for i := range ss.Spec.Template.Spec.InitContainers {
 			c := &ss.Spec.Template.Spec.InitContainers[i]
 			if c.Name == "sysctler" {
-				c.Image = a.proxyImage
+				c.Image = r.proxyImage
 				break
 			}
 		}
 	}
 	pod := &ss.Spec.Template
 	container := &pod.Spec.Containers[0]
-	container.Image = a.proxyImage
+	container.Image = r.proxyImage
 	ss.ObjectMeta = metav1.ObjectMeta{
 		Name:      headlessSvc.Name,
-		Namespace: a.operatorNamespace,
+		Namespace: r.operatorNamespace,
 	}
 	for key, val := range sts.ChildResourceLabels {
 		mak.Set(&ss.ObjectMeta.Labels, key, val)
@@ -678,12 +832,11 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 		},
 	}
 	mak.Set(&pod.Labels, "app", sts.ParentResourceUID)
-	for key, val := range sts.ChildResourceLabels {
-		pod.Labels[key] = val // sync StatefulSet labels to Pod to make it easier for users to select the Pod
-	}
+	// sync StatefulSet labels to Pod to make it easier for users to select the Pod
+	maps.Copy(pod.Labels, sts.ChildResourceLabels)
 
 	if sts.Replicas > 0 {
-		ss.Spec.Replicas = ptr.To(sts.Replicas)
+		ss.Spec.Replicas = new(sts.Replicas)
 	}
 
 	// Generic containerboot configuration options.
@@ -691,6 +844,10 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 		corev1.EnvVar{
 			Name:  "TS_KUBE_SECRET",
 			Value: "$(POD_NAME)",
+		},
+		corev1.EnvVar{
+			Name:  "TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT",
+			Value: "false",
 		},
 		corev1.EnvVar{
 			Name:  "TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR",
@@ -706,11 +863,31 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 		},
 	)
 
-	if sts.ForwardClusterTrafficViaL7IngressProxy {
+	if sts.tailscaledPort != nil {
+		// tailscaled must listen on the target port of the static endpoints
+		// NodePort Services.
 		container.Env = append(container.Env, corev1.EnvVar{
-			Name:  "EXPERIMENTAL_ALLOW_PROXYING_CLUSTER_TRAFFIC_VIA_INGRESS",
-			Value: "true",
+			Name:  "PORT",
+			Value: strconv.Itoa(int(*sts.tailscaledPort)),
 		})
+	}
+
+	if sts.ForwardClusterTrafficViaL7IngressProxy {
+		container.Env = append(container.Env,
+			corev1.EnvVar{
+				Name:  "EXPERIMENTAL_ALLOW_PROXYING_CLUSTER_TRAFFIC_VIA_INGRESS",
+				Value: "true",
+			},
+			// Cluster traffic reaches this proxy on its Pod IP and is
+			// forwarded to the node's Tailscale IP, where serve answers it.
+			// On Linux the serve listener is otherwise bound to the tunnel
+			// interface and would drop that traffic, so opt the listener out
+			// of the interface bind.
+			corev1.EnvVar{
+				Name:  "TS_SERVE_ALLOW_ALL_INTERFACES",
+				Value: "true",
+			},
+		)
 	}
 
 	for i, secret := range proxySecrets {
@@ -731,13 +908,13 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 		})
 	}
 
-	if a.tsFirewallMode != "" {
+	if r.tsFirewallMode != "" {
 		container.Env = append(container.Env, corev1.EnvVar{
 			Name:  "TS_DEBUG_FIREWALL_MODE",
-			Value: a.tsFirewallMode,
+			Value: r.tsFirewallMode,
 		})
 	}
-	pod.Spec.PriorityClassName = a.proxyPriorityClassName
+	pod.Spec.PriorityClassName = r.proxyPriorityClassName
 
 	// Ingress/egress proxy configuration options.
 	if sts.ClusterTargetIP != "" {
@@ -795,7 +972,7 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 		// No need to error out if now or in future we end up in a
 		// situation where app info cannot be determined for one of the
 		// many proxy configurations that the operator can produce.
-		logger.Error("[unexpected] unable to determine proxy type")
+		logger.Error("unable to determine proxy type")
 	} else {
 		container.Env = append(container.Env, corev1.EnvVar{
 			Name:  "TS_INTERNAL_APP",
@@ -812,7 +989,7 @@ func (a *tailscaleSTSReconciler) reconcileSTS(ctx context.Context, logger *zap.S
 		s.ObjectMeta.Labels = ss.Labels
 		s.ObjectMeta.Annotations = ss.Annotations
 	}
-	return createOrUpdate(ctx, a.Client, a.operatorNamespace, ss, updateSS)
+	return createOrUpdate(ctx, r.Client, r.operatorNamespace, ss, updateSS)
 }
 
 func appInfoForProxy(cfg *tailscaleSTSConfig) (string, error) {
@@ -1005,7 +1182,7 @@ func enableEndpoints(ss *appsv1.StatefulSet, metrics, debug bool) {
 		if isMainContainer(&c) {
 			if debug {
 				ss.Spec.Template.Spec.Containers[i].Env = append(ss.Spec.Template.Spec.Containers[i].Env,
-					// Serve tailscaled's debug metrics on on
+					// Serve tailscaled's debug metrics on
 					// <pod-ip>:9001/debug/metrics. If we didn't specify Pod IP
 					// here, the proxy would, in some cases, also listen to its
 					// Tailscale IP- we don't want folks to start relying on this
@@ -1063,7 +1240,7 @@ func isMainContainer(c *corev1.Container) bool {
 
 // tailscaledConfig takes a proxy config, a newly generated auth key if generated and a Secret with the previous proxy
 // state and auth key and returns tailscaled config files for currently supported proxy versions.
-func tailscaledConfig(stsC *tailscaleSTSConfig, newAuthkey string, oldSecret *corev1.Secret, hostname string) (tailscaledConfigs, error) {
+func tailscaledConfig(stsC *tailscaleSTSConfig, loginUrl string, newAuthkey string, oldSecret *corev1.Secret, hostname string, staticEndpoints []netip.AddrPort) (tailscaledConfigs, error) {
 	conf := &ipn.ConfigVAlpha{
 		Version:             "alpha0",
 		AcceptDNS:           "false",
@@ -1094,7 +1271,7 @@ func tailscaledConfig(stsC *tailscaleSTSConfig, newAuthkey string, oldSecret *co
 
 	if newAuthkey != "" {
 		conf.AuthKey = &newAuthkey
-	} else if shouldRetainAuthKey(oldSecret) {
+	} else if !deviceAuthed(oldSecret) {
 		key, err := authKeyFromSecret(oldSecret)
 		if err != nil {
 			return nil, fmt.Errorf("error retrieving auth key from Secret: %w", err)
@@ -1102,13 +1279,41 @@ func tailscaledConfig(stsC *tailscaleSTSConfig, newAuthkey string, oldSecret *co
 		conf.AuthKey = key
 	}
 
+	if loginUrl != "" {
+		conf.ServerURL = new(loginUrl)
+	}
+
 	capVerConfigs := make(map[tailcfg.CapabilityVersion]ipn.ConfigVAlpha)
+	// StaticEndpoints are only understood by clients of capver 102 and newer,
+	// and the config file is parsed strictly, so only include them in the
+	// capver 107 config. Older clients simply won't advertise them.
+	conf.StaticEndpoints = staticEndpoints
 	capVerConfigs[107] = *conf
 
-	// AppConnector config option is only understood by clients of capver 107 and newer.
+	// AppConnector and StaticEndpoints config options are only understood by
+	// clients of capver 107 and 102 (respectively) and newer.
 	conf.AppConnector = nil
+	conf.StaticEndpoints = nil
 	capVerConfigs[95] = *conf
 	return capVerConfigs, nil
+}
+
+// staticEndpointsFromConfigSecret returns the static endpoints previously
+// written to the proxy's tailscaled config Secret, if any.
+func staticEndpointsFromConfigSecret(secret *corev1.Secret, logger *zap.SugaredLogger) []netip.AddrPort {
+	if secret == nil {
+		return nil
+	}
+	conf, err := latestConfigFromSecret(secret)
+	if err != nil {
+		logger.Debugf("failed to unmarshal tailscaled config from secret %q: %v", secret.Name, err)
+		return nil
+	}
+	if conf == nil {
+		logger.Debugf("failed to get tailscaled config from secret %q: empty data", secret.Name)
+		return nil
+	}
+	return conf.StaticEndpoints
 }
 
 // latestConfigFromSecret returns the ipn.ConfigVAlpha with the highest capver
@@ -1143,6 +1348,8 @@ func latestConfigFromSecret(s *corev1.Secret) (*ipn.ConfigVAlpha, error) {
 	return conf, nil
 }
 
+// authKeyFromSecret returns the auth key from the latest config version if
+// found, or else nil.
 func authKeyFromSecret(s *corev1.Secret) (key *string, err error) {
 	conf, err := latestConfigFromSecret(s)
 	if err != nil {
@@ -1159,13 +1366,13 @@ func authKeyFromSecret(s *corev1.Secret) (key *string, err error) {
 	return key, nil
 }
 
-// shouldRetainAuthKey returns true if the state stored in a proxy's state Secret suggests that auth key should be
-// retained (because the proxy has not yet successfully authenticated).
-func shouldRetainAuthKey(s *corev1.Secret) bool {
+// deviceAuthed returns true if the state stored in a proxy's state Secret
+// suggests that the proxy has successfully authenticated.
+func deviceAuthed(s *corev1.Secret) bool {
 	if s == nil {
-		return false // nothing to retain here
+		return false // No state Secret means no device state.
 	}
-	return len(s.Data["device_id"]) == 0 // proxy has not authed yet
+	return len(s.Data["device_id"]) > 0
 }
 
 func shouldAcceptRoutes(pc *tsapi.ProxyClass) bool {
@@ -1327,7 +1534,7 @@ func proxyCapVer(sec *corev1.Secret, podUID string, log *zap.SugaredLogger) tail
 	}
 	capVer, err := strconv.Atoi(string(sec.Data[kubetypes.KeyCapVer]))
 	if err != nil {
-		log.Infof("[unexpected]: unexpected capability version in proxy's state Secret, expected an integer, got %q", string(sec.Data[kubetypes.KeyCapVer]))
+		log.Warnf("unexpected capability version in proxy's state Secret, expected an integer, got %q", string(sec.Data[kubetypes.KeyCapVer]))
 		return tailcfg.CapabilityVersion(-1)
 	}
 	if !strings.EqualFold(podUID, string(sec.Data[kubetypes.KeyPodUID])) {

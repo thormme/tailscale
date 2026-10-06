@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pires/go-proxyproto"
 	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/endpoints/request"
@@ -28,12 +29,13 @@ import (
 	"k8s.io/client-go/transport"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
-	"tailscale.com/envknob"
 	ksr "tailscale.com/k8s-operator/sessionrecording"
 	"tailscale.com/kube/kubetypes"
+	"tailscale.com/net/netutil"
 	"tailscale.com/net/netx"
 	"tailscale.com/sessionrecording"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 	"tailscale.com/tsnet"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/ctxkey"
@@ -43,13 +45,7 @@ import (
 var (
 	// counterNumRequestsproxies counts the number of API server requests proxied via this proxy.
 	counterNumRequestsProxied = clientmetric.NewCounter("k8s_auth_proxy_requests_proxied")
-	// NOTE: adding this metric so we can keep track of users during deprecation
-	counterExperimentalEventsVarUsed = clientmetric.NewCounter("ts_experimental_kube_api_events_var_used")
-	whoIsKey                         = ctxkey.New("", (*apitype.WhoIsResponse)(nil))
-)
-
-const (
-	eventsEnabledVar = "TS_EXPERIMENTAL_KUBE_API_EVENTS"
+	whoIsKey                  = ctxkey.New("", (*apitype.WhoIsResponse)(nil))
 )
 
 // NewAPIServerProxy creates a new APIServerProxy that's ready to start once Run
@@ -70,7 +66,7 @@ func NewAPIServerProxy(zlog *zap.SugaredLogger, restConfig *rest.Config, ts *tsn
 		return nil, fmt.Errorf("could not get rest.TransportConfig(): %w", err)
 	}
 
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr := netutil.NewDefaultTransport()
 	tr.TLSClientConfig, err = transport.TLSConfigFor(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("could not get transport.TLSConfigFor(): %w", err)
@@ -103,7 +99,6 @@ func NewAPIServerProxy(zlog *zap.SugaredLogger, restConfig *rest.Config, ts *tsn
 		upstreamURL:   u,
 		ts:            ts,
 		sendEventFunc: sessionrecording.SendEvent,
-		eventsEnabled: envknob.Bool(eventsEnabledVar),
 	}
 	ap.rp = &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
@@ -134,11 +129,6 @@ func (ap *APIServerProxy) Run(ctx context.Context) error {
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 	}
 
-	if ap.eventsEnabled {
-		counterExperimentalEventsVarUsed.Add(1)
-		ap.log.Warnf("DEPRECATED: %q environment variable is deprecated, and will be removed in v1.96. See documentation for more detail.", eventsEnabledVar)
-	}
-
 	mode := "noauth"
 	if ap.authMode {
 		mode = "auth"
@@ -163,9 +153,17 @@ func (ap *APIServerProxy) Run(ctx context.Context) error {
 		}
 	} else {
 		var err error
-		proxyLn, err = net.Listen("tcp", "localhost:80")
+		baseLn, err := net.Listen("tcp", "localhost:80")
 		if err != nil {
 			return fmt.Errorf("could not listen on :80: %w", err)
+		}
+		proxyLn = &proxyproto.Listener{
+			Listener:          baseLn,
+			ReadHeaderTimeout: 10 * time.Second,
+			ConnPolicy: proxyproto.ConnPolicyFunc(func(opts proxyproto.ConnPolicyOptions) (proxyproto.Policy,
+				error) {
+				return proxyproto.REQUIRE, nil
+			}),
 		}
 		serve = ap.hs.Serve
 	}
@@ -205,10 +203,6 @@ type APIServerProxy struct {
 	upstreamURL *url.URL
 
 	sendEventFunc func(ap netip.AddrPort, event io.Reader, dial netx.DialFunc) error
-
-	// Flag used to enable sending API requests as events to tsrecorder.
-	// Deprecated: events are now set via ACLs (see https://tailscale.com/kb/1246/tailscale-ssh-session-recording#turn-on-session-recording-in-your-tailnet-policy-file)
-	eventsEnabled bool
 }
 
 // serveDefault is the default handler for Kubernetes API server requests.
@@ -237,8 +231,7 @@ func (ap *APIServerProxy) serveDefault(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// NOTE: (ChaosInTheCRD) ap.eventsEnabled deprecated, remove in v1.96
-	if c.enableEvents || ap.eventsEnabled {
+	if c.enableEvents {
 		if err = ap.recordRequestAsEvent(r, who, c.recorderAddresses, c.failOpen); err != nil {
 			msg := fmt.Sprintf("error recording Kubernetes API request: %v", err)
 			ap.log.Errorf(msg)
@@ -308,8 +301,7 @@ func (ap *APIServerProxy) sessionForProto(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// NOTE: (ChaosInTheCRD) ap.eventsEnabled deprecated, remove in v1.96
-	if c.enableEvents || ap.eventsEnabled {
+	if c.enableEvents {
 		if err = ap.recordRequestAsEvent(r, who, c.recorderAddresses, c.failOpen); err != nil {
 			msg := fmt.Sprintf("error recording Kubernetes API request: %v", err)
 			ap.log.Errorf(msg)
@@ -510,7 +502,7 @@ const (
 	// that is respected for this form is group impersonation - for
 	// backwards compatibility reasons.
 	// TODO (irbekrm): determine if anyone uses this and remove if possible.
-	oldCapabilityName = "https://" + tailcfg.PeerCapabilityKubernetes
+	oldCapabilityName = "https://" + peercap.Kubernetes
 )
 
 // addImpersonationHeaders adds the appropriate headers to r to impersonate the
@@ -519,7 +511,7 @@ const (
 func addImpersonationHeaders(r *http.Request, log *zap.SugaredLogger) error {
 	log = log.With("remote", r.RemoteAddr)
 	who := whoIsKey.Value(r.Context())
-	rules, err := tailcfg.UnmarshalCapJSON[kubetypes.KubernetesCapRule](who.CapMap, tailcfg.PeerCapabilityKubernetes)
+	rules, err := tailcfg.UnmarshalCapJSON[kubetypes.KubernetesCapRule](who.CapMap, peercap.Kubernetes)
 	if len(rules) == 0 && err == nil {
 		// Try the old capability name for backwards compatibility.
 		rules, err = tailcfg.UnmarshalCapJSON[kubetypes.KubernetesCapRule](who.CapMap, oldCapabilityName)
@@ -580,7 +572,7 @@ func determineRecorderConfig(who *apitype.WhoIsResponse) (c recorderConfig, _ er
 
 	c.failOpen = true
 	c.enableEvents = false
-	rules, err := tailcfg.UnmarshalCapJSON[kubetypes.KubernetesCapRule](who.CapMap, tailcfg.PeerCapabilityKubernetes)
+	rules, err := tailcfg.UnmarshalCapJSON[kubetypes.KubernetesCapRule](who.CapMap, peercap.Kubernetes)
 	if err != nil {
 		return c, fmt.Errorf("failed to unmarshal Kubernetes capability: %w", err)
 	}

@@ -196,15 +196,15 @@ func TestServer(t *testing.T) {
 		forceClientsMixedAF bool
 	}{
 		{
-			name:        "over ipv4",
+			name:        "over-ipv4",
 			staticAddrs: []netip.Addr{netip.MustParseAddr("127.0.0.1")},
 		},
 		{
-			name:        "over ipv6",
+			name:        "over-ipv6",
 			staticAddrs: []netip.Addr{netip.MustParseAddr("::1")},
 		},
 		{
-			name:                "mixed address families",
+			name:                "mixed-address-families",
 			staticAddrs:         []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1")},
 			forceClientsMixedAF: true,
 		},
@@ -214,7 +214,7 @@ func TestServer(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			reg := new(usermetric.Registry)
 			deregisterMetrics()
-			server, err := NewServer(t.Logf, 0, true, reg)
+			server, err := NewServer(t.Logf, 0, true, reg, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -265,7 +265,7 @@ func TestServer(t *testing.T) {
 			tcB := newTestClient(t, endpoint.VNI, tcBServerEndpointAddr, discoB, discoA.Public(), endpoint.ServerDisco)
 			defer tcB.close()
 
-			for i := 0; i < 2; i++ {
+			for range 2 {
 				// We handshake both clients twice to guarantee server-side
 				// packet reading goroutines, which are independent across
 				// address families, have seen an answer from both clients
@@ -345,7 +345,7 @@ func TestServer_getNextVNILocked(t *testing.T) {
 	s := &Server{
 		nextVNI: minVNI,
 	}
-	for i := uint64(0); i < uint64(totalPossibleVNI); i++ {
+	for range uint64(totalPossibleVNI) {
 		vni, err := s.getNextVNILocked()
 		if err != nil { // using quicktest here triples test time
 			t.Fatal(err)
@@ -543,5 +543,31 @@ func TestServer_endpointGC(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestAllocateEndpointZeroClientDisco verifies that AllocateEndpoint rejects
+// zero client disco keys with an error rather than panicking in
+// DiscoPrivate.Shared, which rejects zero keys. A zero key can arrive from a
+// malicious AllocateUDPRelayEndpointRequest, whose ClientDisco is
+// attacker-chosen.
+func TestAllocateEndpointZeroClientDisco(t *testing.T) {
+	reg := new(usermetric.Registry)
+	deregisterMetrics()
+	server, err := NewServer(t.Logf, 0, true, reg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	server.SetStaticAddrPorts(views.SliceOf([]netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:1")}))
+
+	disco := key.NewDisco().Public()
+	for _, pair := range [][2]key.DiscoPublic{
+		{key.DiscoPublic{}, disco},
+		{disco, key.DiscoPublic{}},
+	} {
+		if _, err := server.AllocateEndpoint(pair[0], pair[1]); err == nil {
+			t.Fatal("AllocateEndpoint succeeded with zero client disco key")
+		}
 	}
 }

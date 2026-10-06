@@ -24,12 +24,6 @@ import (
 	"tailscale.com/wgengine/router"
 )
 
-func init() {
-	router.HookNewUserspaceRouter.Set(func(opts router.NewOpts) (router.Router, error) {
-		return newUserspaceBSDRouter(opts.Logf, opts.Tun, opts.NetMon, opts.Health)
-	})
-}
-
 type userspaceBSDRouter struct {
 	logf    logger.Logf
 	netMon  *netmon.Monitor
@@ -52,7 +46,7 @@ type localRouteInfo struct {
 	ifaceName string     // the interface name
 }
 
-func newUserspaceBSDRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker) (router.Router, error) {
+func newUserspaceBSDRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker) (*userspaceBSDRouter, error) {
 	tunname, err := tundev.Name()
 	if err != nil {
 		return nil, err

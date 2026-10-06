@@ -19,6 +19,7 @@ func (src *Persist) Clone() *Persist {
 	}
 	dst := new(Persist)
 	*dst = *src
+	dst.UserProfile = *src.UserProfile.Clone()
 	if src.AttestationKey != nil {
 		dst.AttestationKey = src.AttestationKey.Clone()
 	}
@@ -32,7 +33,7 @@ var _PersistCloneNeedsRegeneration = Persist(struct {
 	PrivateNodeKey        key.NodePrivate
 	OldPrivateNodeKey     key.NodePrivate
 	UserProfile           tailcfg.UserProfile
-	NetworkLockKey        key.NLPrivate
+	NetworkLockKey        key.TLPrivate
 	NodeID                tailcfg.StableNodeID
 	AttestationKey        key.HardwareAttestationKey
 	DisallowedTKAStateIDs []string

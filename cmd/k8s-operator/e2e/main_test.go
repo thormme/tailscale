@@ -17,8 +17,8 @@ import (
 
 func TestMain(m *testing.M) {
 	flag.Parse()
-	if !*fDevcontrol && os.Getenv("TS_API_CLIENT_SECRET") == "" {
-		log.Printf("Skipping setup: devcontrol is false and TS_API_CLIENT_SECRET is not set")
+	if !*fDevcontrol && os.Getenv("TS_API_CLIENT_SECRET") == "" && os.Getenv("TS_API_CLIENT_ID") == "" {
+		log.Printf("Skipping setup: devcontrol is false and neither TS_API_CLIENT_SECRET nor TS_API_CLIENT_ID is set")
 		os.Exit(m.Run())
 	}
 	code, err := runTests(m)
@@ -58,6 +58,23 @@ func createAndCleanup(t *testing.T, cl client.Client, obj client.Object) {
 			t.Errorf("error cleaning up %s %s/%s: %s", obj.GetObjectKind().GroupVersionKind(), obj.GetNamespace(), obj.GetName(), err)
 		}
 	})
+}
+
+func createAndCleanupErr(t *testing.T, cl client.Client, obj client.Object) error {
+	t.Helper()
+
+	err := cl.Create(t.Context(), obj)
+	if err != nil {
+		return err
+	}
+
+	t.Cleanup(func() {
+		if err := cl.Delete(context.Background(), obj); err != nil {
+			t.Errorf("error cleaning up %s %s/%s: %s", obj.GetObjectKind().GroupVersionKind(), obj.GetNamespace(), obj.GetName(), err)
+		}
+	})
+
+	return nil
 }
 
 func get(ctx context.Context, cl client.Client, obj client.Object) error {

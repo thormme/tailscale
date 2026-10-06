@@ -4,14 +4,36 @@
 package main
 
 import (
-	"maps"
-	"slices"
 	"strings"
 	"testing"
 
 	"tailscale.com/feature/featuretags"
 	"tailscale.com/tstest/deptest"
 )
+
+func TestOmitServiceClientPrefs(t *testing.T) {
+	const msg = "unexpected with ts_omit_serviceclientprefs"
+	deptest.DepChecker{
+		GOOS:   "linux",
+		GOARCH: "amd64",
+		Tags:   "ts_omit_serviceclientprefs,ts_include_cli",
+		BadDeps: map[string]string{
+			"tailscale.com/feature/serviceclientprefs": msg,
+		},
+	}.Check(t)
+}
+
+func TestOmitFavorites(t *testing.T) {
+	const msg = "unexpected with ts_omit_favorites"
+	deptest.DepChecker{
+		GOOS:   "linux",
+		GOARCH: "amd64",
+		Tags:   "ts_omit_favorites,ts_include_cli",
+		BadDeps: map[string]string{
+			"tailscale.com/feature/favorites": msg,
+		},
+	}.Check(t)
+}
 
 func TestOmitSSH(t *testing.T) {
 	const msg = "unexpected with ts_omit_ssh"
@@ -29,6 +51,32 @@ func TestOmitSSH(t *testing.T) {
 			"github.com/pkg/sftp":                  msg,
 			"github.com/u-root/u-root/pkg/termios": msg,
 			"tempfork/gliderlabs/ssh":              msg,
+		},
+	}.Check(t)
+}
+
+func TestOmitSyslog(t *testing.T) {
+	const msg = "unexpected syslog usage with ts_omit_syslog"
+	deptest.DepChecker{
+		GOOS:   "linux",
+		GOARCH: "amd64",
+		// Tailscale SSH's incubator also uses log/syslog, so omit
+		// SSH too to lock down the standard library package.
+		Tags: "ts_omit_syslog,ts_omit_ssh,ts_include_cli",
+		BadDeps: map[string]string{
+			"log/syslog":                   msg,
+			"tailscale.com/feature/syslog": msg,
+		},
+	}.Check(t)
+}
+
+func TestOmitDNSResolveCache(t *testing.T) {
+	deptest.DepChecker{
+		GOOS:   "linux",
+		GOARCH: "amd64",
+		Tags:   "ts_omit_dnsresolvecache,ts_include_cli",
+		BadDeps: map[string]string{
+			"tailscale.com/feature/dnsresolvecache": "unexpected dnsresolvecache usage with ts_omit_dnsresolvecache",
 		},
 	}.Check(t)
 }
@@ -137,6 +185,20 @@ func TestOmitCaptivePortal(t *testing.T) {
 	}.Check(t)
 }
 
+func TestOmitBird(t *testing.T) {
+	deptest.DepChecker{
+		GOOS:   "linux",
+		GOARCH: "amd64",
+		Tags:   "ts_omit_bird,ts_include_cli",
+		OnDep: func(dep string) {
+			switch dep {
+			case "tailscale.com/chirp", "tailscale.com/feature/bird":
+				t.Errorf("unexpected dep with ts_omit_bird: %q", dep)
+			}
+		},
+	}.Check(t)
+}
+
 func TestOmitAuth(t *testing.T) {
 	deptest.DepChecker{
 		GOOS:   "linux",
@@ -202,6 +264,19 @@ func TestOmitPortlist(t *testing.T) {
 	}.Check(t)
 }
 
+func TestOmitRouteCheck(t *testing.T) {
+	deptest.DepChecker{
+		GOOS:   "linux",
+		GOARCH: "amd64",
+		Tags:   "ts_omit_routecheck,ts_include_cli",
+		OnDep: func(dep string) {
+			if strings.Contains(dep, "routecheck") && !strings.HasSuffix(dep, "/peernode") {
+				t.Errorf("unexpected dep: %q", dep)
+			}
+		},
+	}.Check(t)
+}
+
 func TestOmitGRO(t *testing.T) {
 	deptest.DepChecker{
 		GOOS:   "linux",
@@ -227,13 +302,7 @@ func TestOmitUseProxy(t *testing.T) {
 }
 
 func minTags() string {
-	var tags []string
-	for _, f := range slices.Sorted(maps.Keys(featuretags.Features)) {
-		if f.IsOmittable() {
-			tags = append(tags, f.OmitTag())
-		}
-	}
-	return strings.Join(tags, ",")
+	return strings.Join(featuretags.MinTags(), ",")
 }
 
 func TestMinTailscaledNoCLI(t *testing.T) {
@@ -265,7 +334,6 @@ func TestMinTailscaledWithCLI(t *testing.T) {
 	badSubstrs := []string{
 		"cbor",
 		"hujson",
-		"pprof",
 		"multierr", // https://github.com/tailscale/tailscale/pull/17379
 		"tailscale.com/metrics",
 		"tailscale.com/tsweb/varz",
@@ -287,12 +355,31 @@ func TestMinTailscaledWithCLI(t *testing.T) {
 		BadDeps: map[string]string{
 			"golang.org/x/net/http2":                 "unexpected x/net/http2 dep; tailscale/tailscale#17305",
 			"expvar":                                 "unexpected expvar dep",
+			"runtime/pprof":                          "unexpected runtime/pprof dep",
+			"net/http/pprof":                         "unexpected net/http/pprof dep",
 			"github.com/mdlayher/genetlink":          "unexpected genetlink dep",
 			"tailscale.com/clientupdate":             "unexpected clientupdate dep",
 			"filippo.io/edwards25519":                "unexpected edwards25519 dep",
 			"github.com/hdevalence/ed25519consensus": "unexpected ed25519consensus dep",
 			"tailscale.com/clientupdate/distsign":    "unexpected distsign dep",
 			"archive/tar":                            "unexpected archive/tar dep",
+			"tailscale.com/feature/conn25":           "unexpected conn25 dep",
+			"regexp":                                 "unexpected regexp dep; bloats binary",
+			"github.com/toqueteos/webbrowser":        "unexpected webbrowser dep with ts_omit_webbrowser",
+			"github.com/mattn/go-colorable":          "unexpected go-colorable dep with ts_omit_colorable",
 		},
 	}.Check(t)
+}
+
+func TestOmitExitNodeHealth(t *testing.T) {
+	for _, tag := range []string{"ts_omit_exitnodehealth", "ts_omit_health", "ts_omit_useexitnode"} {
+		t.Run(tag, func(t *testing.T) {
+			deptest.DepChecker{
+				GOOS:    "linux",
+				GOARCH:  "amd64",
+				Tags:    tag + ",ts_include_cli",
+				BadDeps: map[string]string{"tailscale.com/feature/exitnodehealth": "unexpected exit node health feature"},
+			}.Check(t)
+		})
+	}
 }

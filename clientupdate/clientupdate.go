@@ -11,6 +11,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,9 +38,29 @@ import (
 	"tailscale.com/version/distro"
 )
 
+// GokrazyUpdateArgs contains arguments for updating a Gokrazy appliance from a
+// GAF fetched from a URL.
+type GokrazyUpdateArgs struct {
+	// URL is the GAF download URL.
+	URL string
+
+	// AllowUnsigned permits installing a GAF without signature verification.
+	// It is intended for tests that serve a GAF from a fileserver that does
+	// not publish distsign.pub.
+	AllowUnsigned bool
+
+	// Logf is optional; nil discards log messages.
+	Logf logger.Logf
+}
+
+// GokrazyUpdateFromURL updates a Gokrazy appliance from a GAF fetched from a
+// URL, if Gokrazy update support is linked into the binary.
+var GokrazyUpdateFromURL feature.Hook[func(context.Context, GokrazyUpdateArgs) error]
+
 const (
-	StableTrack   = "stable"
-	UnstableTrack = "unstable"
+	StableTrack           = "stable"
+	UnstableTrack         = "unstable"
+	ReleaseCandidateTrack = "release-candidate"
 )
 
 var CurrentTrack = func() string {
@@ -80,6 +101,8 @@ type Arguments struct {
 	//     running binary
 	//   - StableTrack and UnstableTrack will use the latest versions of the
 	//     corresponding tracks
+	//   - ReleaseCandidateTrack will use the newest version from StableTrack
+	// 	   and ReleaseCandidateTrack.
 	//
 	// Leaving this empty will use Version or fall back to CurrentTrack if both
 	// Track and Version are empty.
@@ -114,7 +137,7 @@ func (args Arguments) validate() error {
 		return fmt.Errorf("only one of Version(%q) or Track(%q) can be set", args.Version, args.Track)
 	}
 	switch args.Track {
-	case StableTrack, UnstableTrack, "":
+	case StableTrack, UnstableTrack, ReleaseCandidateTrack, "":
 		// All valid values.
 	default:
 		return fmt.Errorf("unsupported track %q", args.Track)
@@ -194,6 +217,17 @@ func (up *Updater) getUpdateFunction() (fn updateFunction, canAutoUpdate bool) {
 			// release cadence with Synology Package Center and use their
 			// auto-update mechanism.
 			return up.updateSynology, false
+		case distro.Gokrazy:
+			// Only the official Tailscale appliance image (built with the
+			// ts_appliance build tag, which causes hostinfo to report
+			// Package="tsapp") is auto-updatable. A user running a custom
+			// Gokrazy build that happens to include tailscaled must not be
+			// updated with our stock GAFs. TS_FORCE_ALLOW_TSAPP_UPDATE is an
+			// escape hatch for callers who know what they're doing.
+			if hi.Package != "tsapp" && !envknob.Bool("TS_FORCE_ALLOW_TSAPP_UPDATE") {
+				return nil, false
+			}
+			return up.updateGokrazy, true
 		case distro.Debian: // includes Ubuntu
 			return up.updateDebLike, true
 		case distro.Arch:
@@ -327,7 +361,7 @@ func (up *Updater) updateSynology() error {
 	if err != nil {
 		return err
 	}
-	latest, err := latestPackages(up.Track)
+	latest, err := LatestPackages(up.Track)
 	if err != nil {
 		return err
 	}
@@ -496,10 +530,10 @@ func (up *Updater) updateDebLike() error {
 const aptSourcesFile = "/etc/apt/sources.list.d/tailscale.list"
 
 // updateDebianAptSourcesList updates the /etc/apt/sources.list.d/tailscale.list
-// file to make sure it has the provided track (stable or unstable) in it.
+// file to make sure it has the provided track (stable, unstable, or release-candidate) in it.
 //
-// If it already has the right track (including containing both stable and
-// unstable), it does nothing.
+// If it already has the right track (including containing both stable,
+// unstable, and release-candidate), it does nothing.
 func updateDebianAptSourcesList(dstTrack string) (rewrote bool, err error) {
 	was, err := os.ReadFile(aptSourcesFile)
 	if err != nil {
@@ -522,7 +556,7 @@ func updateDebianAptSourcesListBytes(was []byte, dstTrack string) (newContent []
 	bs := bufio.NewScanner(bytes.NewReader(was))
 	hadCorrect := false
 	commentLine := regexp.MustCompile(`^\s*\#`)
-	pkgsURL := regexp.MustCompile(`\bhttps://pkgs\.tailscale\.com/((un)?stable)/`)
+	pkgsURL := regexp.MustCompile(`\bhttps://pkgs\.tailscale\.com/(stable|unstable|release-candidate)/`)
 	for bs.Scan() {
 		line := bs.Bytes()
 		if !commentLine.Match(line) {
@@ -616,15 +650,15 @@ func (up *Updater) updateFedoraLike(packageManager string) func() error {
 }
 
 // updateYUMRepoTrack updates the repoFile file to make sure it has the
-// provided track (stable or unstable) in it.
+// provided track (stable, unstable, or release-candidate) in it.
 func updateYUMRepoTrack(repoFile, dstTrack string) (rewrote bool, err error) {
 	was, err := os.ReadFile(repoFile)
 	if err != nil {
 		return false, err
 	}
 
-	urlRe := regexp.MustCompile(`^(baseurl|gpgkey)=https://pkgs\.tailscale\.com/(un)?stable/`)
-	urlReplacement := fmt.Sprintf("$1=https://pkgs.tailscale.com/%s/", dstTrack)
+	urlRe := regexp.MustCompile(`^(baseurl|gpgkey)=https://pkgs\.tailscale\.com/(stable|unstable|release-candidate)`)
+	urlReplacement := fmt.Sprintf("$1=https://pkgs.tailscale.com/%s", dstTrack)
 
 	s := bufio.NewScanner(bytes.NewReader(was))
 	newContent := bytes.NewBuffer(make([]byte, 0, len(was)))
@@ -658,7 +692,7 @@ func updateYUMRepoTrack(repoFile, dstTrack string) (rewrote bool, err error) {
 
 func (up *Updater) updateAlpineLike() (err error) {
 	if up.Version != "" {
-		return errors.New("installing a specific version on Alpine-based distros is not supported")
+		return errors.New("installing a specific version on apk-based distros is not supported")
 	}
 	if err := requireRoot(); err != nil {
 		return err
@@ -688,7 +722,7 @@ func (up *Updater) updateAlpineLike() (err error) {
 		return fmt.Errorf(`failed to parse latest version from "apk info tailscale": %w`, err)
 	}
 	if !up.confirm(ver) {
-		if err := checkOutdatedAlpineRepo(up.Logf, ver, up.Track); err != nil {
+		if err := checkOutdatedAlpineRepo(up.Logf, apkDirPaths, ver, up.Track); err != nil {
 			up.Logf("failed to check whether Alpine release is outdated: %v", err)
 		}
 		return nil
@@ -728,9 +762,12 @@ func parseAlpinePackageVersion(out []byte) (string, error) {
 	return "", errors.New("tailscale version not found in output")
 }
 
-var apkRepoVersionRE = regexp.MustCompile(`v[0-9]+\.[0-9]+`)
+var (
+	apkRepoVersionRE = regexp.MustCompile(`v[0-9]+\.[0-9]+`)
+	apkDirPaths      = []string{"/etc/apk/repositories", "/etc/apk/repositories.d/distfeeds.list"}
+)
 
-func checkOutdatedAlpineRepo(logf logger.Logf, apkVer, track string) error {
+func checkOutdatedAlpineRepo(logf logger.Logf, filePaths []string, apkVer, track string) error {
 	latest, err := LatestTailscaleVersion(track)
 	if err != nil {
 		return err
@@ -739,22 +776,34 @@ func checkOutdatedAlpineRepo(logf logger.Logf, apkVer, track string) error {
 		// Actually on latest release.
 		return nil
 	}
-	f, err := os.Open("/etc/apk/repositories")
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	// Read the first repo line. Typically, there are multiple repos that all
-	// contain the same version in the path, like:
-	//   https://dl-cdn.alpinelinux.org/alpine/v3.20/main
-	//   https://dl-cdn.alpinelinux.org/alpine/v3.20/community
-	s := bufio.NewScanner(f)
-	if !s.Scan() {
-		return s.Err()
-	}
-	alpineVer := apkRepoVersionRE.FindString(s.Text())
-	if alpineVer != "" {
-		logf("The latest Tailscale release for Linux is %q, but your apk repository only provides %q.\nYour Alpine version is %q, you may need to upgrade the system to get the latest Tailscale version: https://wiki.alpinelinux.org/wiki/Upgrading_Alpine", latest, apkVer, alpineVer)
+
+	// OpenWrt uses a different repo file in repositories.d, check for that as well.
+	for _, repoFile := range filePaths {
+		f, err := os.Open(repoFile)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			} else {
+				return err
+			}
+		}
+		defer f.Close()
+		// Read the first repo line. Typically, there are multiple repos that all
+		// contain the same version in the path, like:
+		//   https://dl-cdn.alpinelinux.org/alpine/v3.20/main
+		//   https://dl-cdn.alpinelinux.org/alpine/v3.20/community
+		s := bufio.NewScanner(f)
+		if !s.Scan() {
+			if s.Err() != nil {
+				return s.Err()
+			}
+			logf("The latest Tailscale release for Linux is %q, but your apk repository only provides %q.\nYou may need to upgrade your Alpine system to get the latest Tailscale version: https://wiki.alpinelinux.org/wiki/Upgrading_Alpine", latest, apkVer)
+		}
+		alpineVer := apkRepoVersionRE.FindString(s.Text())
+		if alpineVer != "" {
+			logf("The latest Tailscale release for Linux is %q, but your apk repository only provides %q.\nYour Alpine version is %q, you may need to upgrade the system to get the latest Tailscale version: https://wiki.alpinelinux.org/wiki/Upgrading_Alpine", latest, apkVer, alpineVer)
+		}
+		return nil
 	}
 	return nil
 }
@@ -844,6 +893,56 @@ func (up *Updater) updateFreeBSD() (err error) {
 		return fmt.Errorf("failed to restart tailscaled after update: %w, output:\n%s", err, out)
 	}
 	return nil
+}
+
+// updateGokrazy fetches the latest signed GAF for this gokrazy device variant
+// (vm-amd64, vm-arm64, or pi-arm64) from up.PkgsAddr and applies it via the
+// local gokrazy init update API.
+func (up *Updater) updateGokrazy() error {
+	if !GokrazyUpdateFromURL.IsSet() {
+		return errors.New("gokrazy update support is not linked into this binary")
+	}
+	variant, err := gokrazyDeviceVariant()
+	if err != nil {
+		return err
+	}
+	latest, err := LatestPackages(up.Track)
+	if err != nil {
+		return err
+	}
+	gafName, ok := latest.GAFs[variant]
+	if !ok {
+		return fmt.Errorf("no GAF for device %q on %q track", variant, up.Track)
+	}
+	if latest.GAFsVersion == "" {
+		return fmt.Errorf("no GAF version on %q track", up.Track)
+	}
+	if !up.confirm(latest.GAFsVersion) {
+		return nil
+	}
+	gafURL := fmt.Sprintf("%s/%s/%s", strings.TrimRight(up.PkgsAddr, "/"), up.Track, gafName)
+	up.Logf("Updating to %s (%s)", latest.GAFsVersion, gafURL)
+	return GokrazyUpdateFromURL.Get()(context.Background(), GokrazyUpdateArgs{
+		URL:  gafURL,
+		Logf: up.Logf,
+	})
+}
+
+// gokrazyDeviceVariant returns the GAFs JSON key for the current gokrazy
+// device, e.g. "vm-amd64", "vm-arm64", or "pi-arm64". On arm64, it reads the
+// device-tree model to tell a Raspberry Pi apart from a VM.
+func gokrazyDeviceVariant() (string, error) {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "vm-amd64", nil
+	case "arm64":
+		b, _ := os.ReadFile("/sys/firmware/devicetree/base/model")
+		if strings.HasPrefix(strings.Trim(string(b), "\x00\r\n\t "), "Raspberry Pi") {
+			return "pi-arm64", nil
+		}
+		return "vm-arm64", nil
+	}
+	return "", fmt.Errorf("unsupported gokrazy GOARCH %q", runtime.GOARCH)
 }
 
 func (up *Updater) updateLinuxBinary() error {
@@ -1206,7 +1305,7 @@ func LatestTailscaleVersion(track string) (string, error) {
 		track = CurrentTrack
 	}
 
-	latest, err := latestPackages(track)
+	latest, err := LatestPackages(track)
 	if err != nil {
 		return "", err
 	}
@@ -1218,8 +1317,11 @@ func LatestTailscaleVersion(track string) (string, error) {
 		ver = latest.MacZipsVersion
 	case "linux":
 		ver = latest.TarballsVersion
-		if distro.Get() == distro.Synology {
+		switch distro.Get() {
+		case distro.Synology:
 			ver = latest.SPKsVersion
+		case distro.Gokrazy:
+			ver = latest.GAFsVersion
 		}
 	}
 
@@ -1229,7 +1331,8 @@ func LatestTailscaleVersion(track string) (string, error) {
 	return ver, nil
 }
 
-type trackPackages struct {
+// TrackPackages is the JSON shape served at <pkgs>/<track>/?mode=json.
+type TrackPackages struct {
 	Version         string
 	Tarballs        map[string]string
 	TarballsVersion string
@@ -1237,20 +1340,26 @@ type trackPackages struct {
 	ExesVersion     string
 	MSIs            map[string]string
 	MSIsVersion     string
+	GAFs            map[string]string
+	GAFsVersion     string
 	MacZips         map[string]string
 	MacZipsVersion  string
 	SPKs            map[string]map[string]string
 	SPKsVersion     string
 }
 
-func latestPackages(track string) (*trackPackages, error) {
-	url := fmt.Sprintf("https://pkgs.tailscale.com/%s/?mode=json&os=%s", track, runtime.GOOS)
+var tailscaleHTTPEndpoint = "https://pkgs.tailscale.com"
+
+// LatestPackages fetches the package manifest served at
+// <pkgs>/<track>/?mode=json for the current runtime.GOOS.
+func LatestPackages(track string) (*TrackPackages, error) {
+	url := fmt.Sprintf("%s/%s/?mode=json&os=%s", tailscaleHTTPEndpoint, track, runtime.GOOS)
 	res, err := http.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("fetching latest tailscale version: %w", err)
 	}
 	defer res.Body.Close()
-	var latest trackPackages
+	var latest TrackPackages
 	if err := json.NewDecoder(res.Body).Decode(&latest); err != nil {
 		return nil, fmt.Errorf("decoding JSON: %v: %w", res.Status, err)
 	}
@@ -1272,6 +1381,6 @@ func requireRoot() error {
 }
 
 func isExitError(err error) bool {
-	var exitErr *exec.ExitError
-	return errors.As(err, &exitErr)
+	_, ok := errors.AsType[*exec.ExitError](err)
+	return ok
 }

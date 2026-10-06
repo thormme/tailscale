@@ -12,10 +12,8 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	jsonv1 "encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -31,8 +29,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bradfitz/go-tool-cache/cacheproc"
-	"github.com/bradfitz/go-tool-cache/cachers"
+	"github.com/tailscale/tb/gocache/cacheproc"
+	"github.com/tailscale/tb/gocache/cachers"
 )
 
 func main() {
@@ -99,21 +97,21 @@ func main() {
 		if *srvURL == "" {
 			log.Fatal("--cigocached-url is empty; cannot fetch stats")
 		}
-		tk := *token
-		if tk == "" {
-			log.Fatal("--token is empty; cannot fetch stats")
-		}
-		c := &gocachedClient{
-			baseURL:     *srvURL,
-			cl:          httpClient(srvHost, *srvHostDial),
-			accessToken: tk,
-			verbose:     *verbose,
-		}
-		stats, err := c.fetchStats()
+		stats, err := fetchStats(httpClient(srvHost, *srvHostDial), *srvURL, *token)
 		if err != nil {
-			log.Fatalf("error fetching gocached stats: %v", err)
+			// Errors that are not due to misconfiguration are non-fatal so we
+			// don't fail builds if e.g. cigocached is down.
+			//
+			// Print error as JSON so it can still be piped through jq.
+			statsErr := map[string]any{
+				"error": fmt.Sprintf("fetching gocached stats: %v", err),
+			}
+			b, _ := jsonv1.Marshal(statsErr)
+			fmt.Println(string(b))
+		} else {
+			fmt.Println(stats)
 		}
-		fmt.Println(stats)
+
 		return
 	}
 
@@ -123,7 +121,6 @@ func main() {
 			log.Fatal(err)
 		}
 		*dir = filepath.Join(d, "go-cacher")
-		log.Printf("Defaulting to cache dir %v ...", *dir)
 	}
 	if err := os.MkdirAll(*dir, 0750); err != nil {
 		log.Fatal(err)
@@ -140,18 +137,33 @@ func main() {
 		if *verbose {
 			log.Printf("Using cigocached at %s", *srvURL)
 		}
-		c.gocached = &gocachedClient{
-			baseURL:     *srvURL,
-			cl:          httpClient(srvHost, *srvHostDial),
-			accessToken: *token,
-			verbose:     *verbose,
+		c.remote = &cachers.HTTPClient{
+			BaseURL:               *srvURL,
+			Disk:                  c.disk,
+			HTTPClient:            httpClient(srvHost, *srvHostDial),
+			AccessToken:           *token,
+			Verbose:               *verbose,
+			BestEffortHTTP:        true,
+			AsyncPutTimeout:       asyncPutTimeout,
+			AsyncPutMaxConcurrent: 10,
 		}
 	}
 	var p *cacheproc.Process
 	p = &cacheproc.Process{
 		Close: func() error {
+			if c.remote != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if !c.remote.Shutdown(ctx) {
+					log.Printf("cigocacher: timed out waiting for background PUTs to drain")
+				}
+				// Always surface dropped PUTs.
+				if timedOut, canceled := c.remote.PutsTimedOut.Load(), c.remote.PutsCanceled.Load(); timedOut+canceled > 0 {
+					log.Printf("cigocacher: %d background PUTs timed out, %d canceled", timedOut, canceled)
+				}
+			}
 			if c.verbose {
-				log.Printf("gocacheprog: closing; %d gets (%d hits, %d misses, %d errors); %d puts (%d errors)",
+				log.Printf("cigocacher: closing; %d gets (%d hits, %d misses, %d errors); %d puts (%d errors)",
 					p.Gets.Load(), p.GetHits.Load(), p.GetMisses.Load(), p.GetErrors.Load(), p.Puts.Load(), p.PutErrors.Load())
 			}
 			return c.close()
@@ -186,9 +198,9 @@ func httpClient(srvHost, srvHostDial string) *http.Client {
 }
 
 type cigocacher struct {
-	disk     *cachers.DiskCache
-	gocached *gocachedClient
-	verbose  bool
+	disk    *cachers.DiskCache
+	remote  *cachers.HTTPClient // nil if no remote server
+	verbose bool
 
 	getNanos      atomic.Int64 // total nanoseconds spent in gets
 	putNanos      atomic.Int64 // total nanoseconds spent in puts
@@ -209,39 +221,33 @@ func (c *cigocacher) get(ctx context.Context, actionID string) (outputID, diskPa
 	defer func() {
 		c.getNanos.Add(time.Since(t0).Nanoseconds())
 	}()
-	if c.gocached == nil {
-		return c.disk.Get(ctx, actionID)
-	}
 
 	outputID, diskPath, err = c.disk.Get(ctx, actionID)
-	if err == nil && outputID != "" {
-		return outputID, diskPath, nil
+	if c.remote == nil || (err == nil && outputID != "") {
+		return outputID, diskPath, err
 	}
 
+	// Disk miss; try remote. HTTPClient.Get handles the HTTP fetch
+	// (including lz4 decompression) and writes to disk for us.
 	c.getHTTP.Add(1)
 	t0HTTP := time.Now()
 	defer func() {
 		c.getHTTPNanos.Add(time.Since(t0HTTP).Nanoseconds())
 	}()
-	outputID, res, err := c.gocached.get(ctx, actionID)
+	outputID, diskPath, err = c.remote.Get(ctx, actionID)
 	if err != nil {
 		c.getHTTPErrors.Add(1)
 		return "", "", nil
 	}
-	if outputID == "" || res == nil {
+	if outputID == "" {
 		c.getHTTPMisses.Add(1)
 		return "", "", nil
 	}
 
-	defer res.Body.Close()
-
-	diskPath, err = put(c.disk, actionID, outputID, res.ContentLength, res.Body)
-	if err != nil {
-		return "", "", fmt.Errorf("error filling disk cache from HTTP: %w", err)
-	}
-
 	c.getHTTPHits.Add(1)
-	c.getHTTPBytes.Add(res.ContentLength)
+	if fi, err := os.Stat(diskPath); err == nil {
+		c.getHTTPBytes.Add(fi.Size())
+	}
 	return outputID, diskPath, nil
 }
 
@@ -250,56 +256,25 @@ func (c *cigocacher) put(ctx context.Context, actionID, outputID string, size in
 	defer func() {
 		c.putNanos.Add(time.Since(t0).Nanoseconds())
 	}()
-	if c.gocached == nil {
-		return put(c.disk, actionID, outputID, size, r)
+
+	if c.remote == nil {
+		return c.disk.Put(ctx, actionID, outputID, size, r)
 	}
 
 	c.putHTTP.Add(1)
-	var diskReader, httpReader io.Reader
-	tee := &bestEffortTeeReader{r: r}
-	if size == 0 {
-		// Special case the empty file so NewRequest sets "Content-Length: 0",
-		// as opposed to thinking we didn't set it and not being able to sniff its size
-		// from the type.
-		diskReader, httpReader = bytes.NewReader(nil), bytes.NewReader(nil)
-	} else {
-		pr, pw := io.Pipe()
-		defer pw.Close()
-		// The diskReader is in the driving seat. We will try to forward data
-		// to httpReader as well, but only best-effort.
-		diskReader = tee
-		tee.w = pw
-		httpReader = pr
-	}
-	httpErrCh := make(chan error)
-	go func() {
-		t0HTTP := time.Now()
-		defer func() {
-			c.putHTTPNanos.Add(time.Since(t0HTTP).Nanoseconds())
-		}()
-		httpErrCh <- c.gocached.put(ctx, actionID, outputID, size, httpReader)
-	}()
-
-	diskPath, err = put(c.disk, actionID, outputID, size, diskReader)
+	diskPath, err = c.remote.Put(ctx, actionID, outputID, size, r)
+	c.putHTTPNanos.Add(time.Since(t0).Nanoseconds())
 	if err != nil {
-		return "", fmt.Errorf("error writing to disk cache: %w", errors.Join(err, tee.err))
+		c.putHTTPErrors.Add(1)
+	} else {
+		c.putHTTPBytes.Add(size)
 	}
 
-	select {
-	case err := <-httpErrCh:
-		if err != nil {
-			c.putHTTPErrors.Add(1)
-		} else {
-			c.putHTTPBytes.Add(size)
-		}
-	case <-ctx.Done():
-	}
-
-	return diskPath, nil
+	return diskPath, err
 }
 
 func (c *cigocacher) close() error {
-	if !c.verbose || c.gocached == nil {
+	if !c.verbose || c.remote == nil {
 		return nil
 	}
 
@@ -307,7 +282,7 @@ func (c *cigocacher) close() error {
 		c.getHTTP.Load(), float64(c.getHTTPBytes.Load())/float64(1<<20), float64(c.getHTTPNanos.Load())/float64(time.Second), c.getHTTPHits.Load(), c.getHTTPMisses.Load(), c.getHTTPErrors.Load(),
 		c.putHTTP.Load(), float64(c.putHTTPBytes.Load())/float64(1<<20), float64(c.putHTTPNanos.Load())/float64(time.Second), c.putHTTPErrors.Load())
 
-	stats, err := c.gocached.fetchStats()
+	stats, err := fetchStats(c.remote.HTTPClient, c.remote.BaseURL, c.remote.AccessToken)
 	if err != nil {
 		log.Printf("error fetching gocached stats: %v", err)
 	} else {
@@ -354,19 +329,42 @@ func fetchAccessToken(cl *http.Client, idTokenURL, idTokenRequestToken, gocached
 	return accessToken.AccessToken, nil
 }
 
-type bestEffortTeeReader struct {
-	r   io.Reader
-	w   io.WriteCloser
-	err error
+func fetchStats(cl *http.Client, baseURL, accessToken string) (string, error) {
+	req, _ := http.NewRequest("GET", baseURL+"/session/stats", nil)
+	if accessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+	}
+	resp, err := cl.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fetching stats: %s", resp.Status)
+	}
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
-func (t *bestEffortTeeReader) Read(p []byte) (int, error) {
-	n, err := t.r.Read(p)
-	if n > 0 && t.w != nil {
-		if _, err := t.w.Write(p[:n]); err != nil {
-			t.err = errors.Join(err, t.w.Close())
-			t.w = nil
-		}
-	}
-	return n, err
+const (
+	// minPutTimeout is the floor we clamp to for small objects where the time is
+	// dominated by fixed overheads like connection establishment, waiting for a
+	// busy server to service the request etc.
+	minPutTimeout = 5 * time.Second
+	// maxPutTimeout is the ceiling we clamp to for large objects.
+	maxPutTimeout = 30 * time.Second
+	// minAverageBandwidth is the minimum average bandwidth (2MiB/s) we require
+	// for PUTs to complete within the timeout in its linear scaling region.
+	minAverageBandwidth = 2 * 1 << 20 / float64(time.Second)
+)
+
+// asyncPutTimeout returns a size-dependent timeout for async PUTs to the remote
+// gocached server. It returns 5s for size <= 10MiB, 30s for size >= 60MiB and
+// scales linearly in between.
+func asyncPutTimeout(size int64) time.Duration {
+	timeout := time.Duration(float64(size) / minAverageBandwidth)
+	return min(max(minPutTimeout, timeout), maxPutTimeout)
 }

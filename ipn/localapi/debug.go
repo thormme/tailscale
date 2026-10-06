@@ -6,8 +6,10 @@
 package localapi
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +25,7 @@ import (
 	"tailscale.com/feature"
 	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/ipn"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/httpm"
@@ -35,6 +38,7 @@ func init() {
 	Register("dev-set-state-store", (*Handler).serveDevSetStateStore)
 	Register("debug-bus-events", (*Handler).serveDebugBusEvents)
 	Register("debug-bus-graph", (*Handler).serveEventBusGraph)
+	Register("debug-bus-queues", (*Handler).serveDebugBusQueues)
 	Register("debug-derp-region", (*Handler).serveDebugDERPRegion)
 	Register("debug-dial-types", (*Handler).serveDebugDialTypes)
 	Register("debug-log", (*Handler).serveDebugLog)
@@ -140,14 +144,11 @@ func (h *Handler) serveDebugDialTypes(w http.ResponseWriter, r *http.Request) {
 
 	var wg sync.WaitGroup
 	for _, dialer := range dialers {
-		dialer := dialer // loop capture
 
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			conn, err := dialer.dial(ctx, network, addr)
 			results <- result{dialer.name, conn, err}
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -200,8 +201,6 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		h.b.DebugNotify(n)
-	case "notify-last-netmap":
-		h.b.DebugNotifyLastNetMap()
 	case "break-tcp-conns":
 		err = h.b.DebugBreakTCPConns()
 	case "break-derp-conns":
@@ -218,7 +217,7 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 	case "pick-new-derp":
 		err = h.b.DebugPickNewDERP()
 	case "force-prefer-derp":
-		var n int
+		var n tailcfg.DERPRegionID
 		err = json.NewDecoder(r.Body).Decode(&n)
 		if err != nil {
 			break
@@ -233,8 +232,39 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 		if err == nil {
 			return
 		}
+	case "peer-disco-keys":
+		w.Header().Set("Content-Type", "application/json")
+		err = json.NewEncoder(w).Encode(h.b.DebugPeerDiscoKeys())
+		if err == nil {
+			return
+		}
 	case "rotate-disco-key":
 		err = h.b.DebugRotateDiscoKey()
+	case "statedir":
+		root := h.b.TailscaleVarRoot()
+		w.Header().Set("Content-Type", "application/json")
+		err = json.NewEncoder(w).Encode(root)
+		if err == nil {
+			return
+		}
+	case "clear-netmap-cache":
+		h.b.ClearNetmapCache(r.Context())
+	case "current-netmap":
+		// Return the current netmap (with peers populated) as JSON. This
+		// is a debug-only path: the netmap.NetworkMap shape is an
+		// internal type and may change without notice. Production
+		// callers should fetch the narrower bits they need via their
+		// own LocalAPI methods instead.
+		nm := h.b.NetMapWithPeers()
+		if nm == nil {
+			err = errors.New("no netmap")
+			break
+		}
+		w.Header().Set("Content-Type", "application/json")
+		err = json.NewEncoder(w).Encode(nm)
+		if err == nil {
+			return
+		}
 	case "":
 		err = fmt.Errorf("missing parameter 'action'")
 	default:
@@ -251,6 +281,13 @@ func (h *Handler) serveDebug(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) serveDevSetStateStore(w http.ResponseWriter, r *http.Request) {
 	if !h.PermitWrite {
 		http.Error(w, "debug access denied", http.StatusForbidden)
+		return
+	}
+	// state keys are otherwise gated by their own handlers, e.g. serve-config
+	// requires a local admin for Unix-socket targets; writing a _serve/<profile>
+	// key here would bypass that, so require a local admin too
+	if !h.Actor.IsLocalAdmin(h.b.OperatorUserID()) {
+		http.Error(w, "dev-set-state-store access denied; must be a local admin", http.StatusUnauthorized)
 		return
 	}
 	if r.Method != httpm.POST {
@@ -270,7 +307,7 @@ func (h *Handler) serveDebugPacketFilterRules(w http.ResponseWriter, r *http.Req
 		http.Error(w, "debug access denied", http.StatusForbidden)
 		return
 	}
-	nm := h.b.NetMap()
+	nm := h.b.NetMapNoPeers()
 	if nm == nil {
 		http.Error(w, "no netmap", http.StatusNotFound)
 		return
@@ -287,7 +324,7 @@ func (h *Handler) serveDebugPacketFilterMatches(w http.ResponseWriter, r *http.R
 		http.Error(w, "debug access denied", http.StatusForbidden)
 		return
 	}
-	nm := h.b.NetMap()
+	nm := h.b.NetMapNoPeers()
 	if nm == nil {
 		http.Error(w, "no netmap", http.StatusNotFound)
 		return
@@ -424,12 +461,68 @@ func (h *Handler) serveEventBusGraph(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(topics)
 }
 
+func (h *Handler) serveDebugBusQueues(w http.ResponseWriter, r *http.Request) {
+	if r.Method != httpm.GET {
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	bus, ok := h.LocalBackend().Sys().Bus.GetOK()
+	if !ok {
+		http.Error(w, "event bus not running", http.StatusPreconditionFailed)
+		return
+	}
+
+	debugger := bus.Debugger()
+
+	type clientQueue struct {
+		Name           string   `json:"name"`
+		SubscribeDepth int      `json:"subscribeDepth"`
+		SubscribeTypes []string `json:"subscribeTypes,omitempty"`
+		PublishTypes   []string `json:"publishTypes,omitempty"`
+	}
+
+	publishQueue := debugger.PublishQueue()
+	clients := debugger.Clients()
+	result := struct {
+		PublishQueueDepth int           `json:"publishQueueDepth"`
+		Clients           []clientQueue `json:"clients"`
+	}{
+		PublishQueueDepth: len(publishQueue),
+	}
+
+	for _, c := range clients {
+		sq := debugger.SubscribeQueue(c)
+		cq := clientQueue{
+			Name:           c.Name(),
+			SubscribeDepth: len(sq),
+		}
+		for _, t := range debugger.SubscribeTypes(c) {
+			cq.SubscribeTypes = append(cq.SubscribeTypes, t.String())
+		}
+		for _, t := range debugger.PublishTypes(c) {
+			cq.PublishTypes = append(cq.PublishTypes, t.String())
+		}
+		result.Clients = append(result.Clients, cq)
+	}
+
+	slices.SortFunc(result.Clients, func(a, b clientQueue) int {
+		if a.SubscribeDepth != b.SubscribeDepth {
+			return b.SubscribeDepth - a.SubscribeDepth
+		}
+		return cmp.Compare(a.Name, b.Name)
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
 func (h *Handler) serveDebugLog(w http.ResponseWriter, r *http.Request) {
 	if !buildfeatures.HasLogTail {
 		http.Error(w, feature.ErrUnavailable.Error(), http.StatusNotImplemented)
 		return
 	}
-	if !h.PermitRead {
+	if !h.PermitWrite {
 		http.Error(w, "debug-log access denied", http.StatusForbidden)
 		return
 	}
@@ -472,6 +565,7 @@ func (h *Handler) serveDebugLog(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) serveDebugOptionalFeatures(w http.ResponseWriter, r *http.Request) {
 	of := &apitype.OptionalFeatures{
 		Features: feature.Registered(),
+		Disabled: feature.EnvDisabled(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(of)
